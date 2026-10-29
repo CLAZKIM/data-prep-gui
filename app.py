@@ -1,8 +1,11 @@
 import os
+import io
 import re
+import csv
 import glob
 import json
 import math
+import hashlib
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -259,6 +262,9 @@ def init_session_state() -> None:
         "inferred_unit_hints": {},
         "numeric_clean_report": {},
         "data_quality_report": None,
+        # Phase 6: 다중 헤더 CSV(한글명·단위·변수분류 선택형 메타데이터) 자동 인식 상태
+        "csv_tag_metadata": {},
+        "csv_meta_parse_info": None,
         # Phase 2: 4대 공정 변수 매핑 상태
         "var_mapping": {
             "feed": [],
@@ -353,12 +359,12 @@ def load_csv_safely(file_source) -> pd.DataFrame:
         try:
             if hasattr(file_source, "seek"):
                 file_source.seek(0)
-            return pd.read_csv(file_source, encoding=enc)
+            return pd.read_csv(file_source, encoding=enc, low_memory=False)
         except Exception:
             continue
     if hasattr(file_source, "seek"):
         file_source.seek(0)
-    return pd.read_csv(file_source)
+    return pd.read_csv(file_source, low_memory=False)
 
 
 def detect_time_column(df: pd.DataFrame) -> Optional[str]:
@@ -502,6 +508,797 @@ def clean_nonstandard_numeric_columns(
                 unit_hints[str(col)] = "%"
 
     return cleaned_df, clean_report, unit_hints
+
+
+# ------------------------------------------------------------------------------
+# Phase 6 핵심 로직: 다중 헤더 CSV(한글명·단위·변수분류 선택형 메타데이터) 자동 인식 및 템플릿 생성
+# ------------------------------------------------------------------------------
+META_NAME_KEYWORDS = {
+    "한글명",
+    "한글명칭",
+    "명칭",
+    "이름",
+    "태그명칭",
+    "태그설명",
+    "변수명",
+    "한글변수명",
+    "변수설명",
+    "설명",
+    "항목명",
+    "공정변수명",
+    "name",
+    "names",
+    "korname",
+    "koreanname",
+    "desc",
+    "description",
+    "descriptions",
+    "label",
+    "labels",
+}
+
+META_UNIT_KEYWORDS = {
+    "단위",
+    "공학단위",
+    "측정단위",
+    "unit",
+    "units",
+    "uom",
+    "engunit",
+    "engunits",
+    "engineeringunit",
+    "engineeringunits",
+}
+
+META_CATEGORY_KEYWORDS = {
+    "분류",
+    "변수분류",
+    "역할",
+    "변수역할",
+    "구분",
+    "변수구분",
+    "카테고리",
+    "4대변수",
+    "category",
+    "categories",
+    "role",
+    "roles",
+    "type",
+    "types",
+    "vartype",
+    "varcategory",
+}
+
+KNOWN_UNIT_TOKENS = {
+    "%",
+    "wt%",
+    "vol%",
+    "mol%",
+    "ppm",
+    "ppb",
+    "ph",
+    "°c",
+    "℃",
+    "degc",
+    "k",
+    "°f",
+    "℉",
+    "degf",
+    "bar",
+    "barg",
+    "bara",
+    "mbar",
+    "pa",
+    "kpa",
+    "mpa",
+    "atm",
+    "mmhg",
+    "torr",
+    "mmh2o",
+    "inh2o",
+    "psi",
+    "psig",
+    "psia",
+    "g",
+    "kg",
+    "ton",
+    "t",
+    "mg",
+    "lb",
+    "l",
+    "ml",
+    "m3",
+    "nm3",
+    "sm3",
+    "bbl",
+    "gal",
+    "s",
+    "sec",
+    "min",
+    "h",
+    "hr",
+    "day",
+    "d",
+    "w",
+    "kw",
+    "mw",
+    "j",
+    "kj",
+    "mj",
+    "gj",
+    "cal",
+    "kcal",
+    "mcal",
+    "gcal",
+    "btu",
+    "a",
+    "ma",
+    "v",
+    "kv",
+    "hz",
+    "rpm",
+    "cp",
+    "cst",
+    "kgf",
+    "n",
+    "kn",
+    "mol",
+    "kmol",
+    "ratio",
+}
+
+
+def _classify_explicit_meta_keyword(val: Any) -> Optional[str]:
+    """첫 번째 컬럼 셀 값이 명시적 메타데이터 행 식별 키워드('name', 'unit', 'category')인지 판별합니다."""
+    if val is None or pd.isna(val):
+        return None
+    raw = str(val).strip()
+    if not raw:
+        return None
+    norm = re.sub(r"^[\s#\[\]()\-_:]+|[\s#\[\]()\-_:]+$", "", raw).lower()
+    compact = re.sub(r"[\s_\-]+", "", norm)
+    for candidate in (norm, compact):
+        if candidate in META_NAME_KEYWORDS:
+            return "name"
+        if candidate in META_UNIT_KEYWORDS:
+            return "unit"
+        if candidate in META_CATEGORY_KEYWORDS:
+            return "category"
+    return None
+
+
+def normalize_category_token(val: Any) -> str:
+    """
+    CSV 메타데이터 행의 변수 분류 문자열을 표준 카테고리 키('feed', 'control', 'state', 'kpi')로 정규화합니다.
+    대소문자를 무시하며, 유효하지 않거나 비어 있으면 빈 문자열('')을 반환합니다.
+    """
+    if val is None or pd.isna(val):
+        return ""
+    raw = str(val).strip().lower()
+    if not raw or raw in ("-", "nan", "none", "null", "n/a", "na"):
+        return ""
+    if raw in ("feed", "control", "state", "kpi"):
+        return raw
+
+    compact = re.sub(r"[\s_\-]+", "", raw)
+    alias_map = {
+        "feed": "feed",
+        "원료": "feed",
+        "투입": "feed",
+        "원료/투입": "feed",
+        "원료투입": "feed",
+        "원료변수": "feed",
+        "투입변수": "feed",
+        "①feed": "feed",
+        "1.feed": "feed",
+        "control": "control",
+        "mv": "control",
+        "sv": "control",
+        "제어": "control",
+        "조작": "control",
+        "제어/조작": "control",
+        "제어조작": "control",
+        "제어변수": "control",
+        "조작변수": "control",
+        "②control": "control",
+        "2.control": "control",
+        "state": "state",
+        "constraint": "state",
+        "constraints": "state",
+        "상태": "state",
+        "제약": "state",
+        "상태/제약": "state",
+        "상태제약": "state",
+        "상태변수": "state",
+        "제약변수": "state",
+        "③state": "state",
+        "3.state": "state",
+        "kpi": "kpi",
+        "target": "kpi",
+        "objective": "kpi",
+        "목표": "kpi",
+        "성과": "kpi",
+        "목표성과": "kpi",
+        "목표/성과": "kpi",
+        "목표변수": "kpi",
+        "성과변수": "kpi",
+        "④kpi": "kpi",
+        "4.kpi": "kpi",
+    }
+    if raw in alias_map:
+        return alias_map[raw]
+    if compact in alias_map:
+        return alias_map[compact]
+    return ""
+
+
+def _looks_like_datetime_scalar(val: Any) -> bool:
+    """셀 값이 시계열 데이터의 날짜/시각 문자열(예: 2025-12-01 0:00)인지 판별합니다."""
+    if val is None or pd.isna(val):
+        return False
+    if isinstance(val, pd.Timestamp):
+        return True
+    s = str(val).strip()
+    if len(s) < 6 or s.endswith("%"):
+        return False
+    if not re.search(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}", s):
+        return False
+    try:
+        parsed = pd.to_datetime(s, errors="raise")
+        return pd.notna(parsed)
+    except Exception:
+        return False
+
+
+def _looks_like_unit_value(val: str) -> bool:
+    """휴리스틱 모드에서 셀 문자열이 화학공학 단위(예: t/h, °C, bar, ppm, %)인지 판별합니다."""
+    s = (val or "").strip()
+    if not s or len(s) > 15:
+        return False
+    if normalize_category_token(s):
+        return False
+    if _looks_like_datetime_scalar(s):
+        return False
+    if not math.isnan(_coerce_numeric_scalar(s)):
+        return False
+
+    compact = s.lower().replace(" ", "")
+    if compact in KNOWN_UNIT_TOKENS:
+        return True
+    if any(sym in s for sym in ("°", "℃", "℉", "%", "²", "³", "μ", "µ")) and " " not in s:
+        return True
+    if "/" in s and " " not in s:
+        parts = s.split("/")
+        if len(parts) == 2 and all(1 <= len(p) <= 8 for p in parts):
+            if not (parts[0].isdigit() and parts[1].isdigit()):
+                if not any(re.search(r"[가-힣]{2,}", p) for p in parts):
+                    return True
+    return False
+
+
+def _restore_standard_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    다중 헤더 메타데이터 행으로 인해 문자열(object)로 읽힌 일반 수치형 컬럼들을
+    표준 수치 타입(int64/float64)으로 복원합니다.
+    ('%', 천단위 ',' 등이 포함된 비표준 수치 문자열 컬럼은 이후 clean_nonstandard_numeric_columns에서 정제되도록 유지합니다.)
+    """
+    if df is None or df.empty:
+        return df
+
+    new_series_list: List[pd.Series] = []
+    for col_idx in range(len(df.columns)):
+        s = df.iloc[:, col_idx]
+        col_name = df.columns[col_idx]
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_datetime64_any_dtype(s):
+            new_series_list.append(s)
+            continue
+
+        non_null = s.dropna().astype(str)
+        non_empty = non_null[non_null.str.strip() != ""]
+        if non_empty.empty or non_empty.str.contains("%|,", regex=True).any():
+            new_series_list.append(s)
+            continue
+
+        converted = pd.to_numeric(non_empty, errors="coerce")
+        if converted.notna().all():
+            cleaned_input = s.mask(s.isna() | (s.astype(str).str.strip() == ""))
+            full_numeric = pd.to_numeric(cleaned_input, errors="coerce")
+            full_numeric.name = col_name
+            new_series_list.append(full_numeric)
+        else:
+            new_series_list.append(s)
+
+    return pd.concat(new_series_list, axis=1)
+
+
+def parse_csv_with_optional_metadata(
+    df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, str]], Dict[str, Any]]:
+    """
+    기존 단일 헤더 CSV(1행 태그명 + 시계열 데이터)와의 100% 하위 호환을 보장하면서,
+    CSV 상위 1~3행(파일 2~4행)에 선택적으로 포함된 메타데이터 행(한글명, 단위, 분류)을
+    자동 감지·추출하고 실제 시계열 데이터 영역을 분리합니다.
+    """
+    empty_info: Dict[str, Any] = {
+        "meta_row_count": 0,
+        "detected_rows": [],
+    }
+    if df is None or df.empty or len(df.columns) == 0:
+        return df, {}, empty_info
+
+    placeholder_tokens = {"", "-", "nan", "none", "null", "n/a", "na"}
+    max_inspect = min(3, len(df))
+
+    # 본문(하단 데이터 영역)에서 수치형 센서 컬럼 존재 여부를 사전 확인 (휴리스틱 오탐 방지)
+    body_start = min(max_inspect, len(df) - 1)
+    body_sample = df.iloc[body_start : min(len(df), body_start + 25)]
+    body_numeric_col_indices: List[int] = []
+    if not body_sample.empty:
+        for c_idx in range(len(df.columns)):
+            col_s = body_sample.iloc[:, c_idx].dropna()
+            if col_s.empty:
+                continue
+            str_s = col_s.astype(str).str.strip()
+            str_s = str_s[~str_s.str.lower().isin(placeholder_tokens)]
+            if str_s.empty:
+                continue
+            num_s = _coerce_numeric_series(str_s)
+            if (num_s.notna().sum() / len(str_s)) >= 0.7:
+                body_numeric_col_indices.append(c_idx)
+
+    detected_rows_meta: List[Dict[str, Any]] = []
+    assigned_types: set = set()
+    meta_end_idx = 0
+
+    for r in range(max_inspect):
+        row = df.iloc[r]
+        first_raw = row.iloc[0] if len(row) > 0 else None
+        first_str = "" if (first_raw is None or pd.isna(first_raw)) else str(first_raw).strip()
+
+        # 1) 첫 번째 컬럼의 명시적 식별 키워드 검사
+        explicit_type = _classify_explicit_meta_keyword(first_raw)
+
+        rest_cells = [row.iloc[i] for i in range(1, len(row))]
+        rest_valid: List[str] = []
+        for v in rest_cells:
+            if v is None or pd.isna(v):
+                continue
+            sv = str(v).strip()
+            if sv.lower() not in placeholder_tokens:
+                rest_valid.append(sv)
+
+        rest_num_cnt = sum(
+            1 for sv in rest_valid if not math.isnan(_coerce_numeric_scalar(sv))
+        )
+        rest_num_ratio = (rest_num_cnt / len(rest_valid)) if rest_valid else 0.0
+
+        if explicit_type is not None:
+            if rest_valid and rest_num_ratio >= 0.6:
+                break
+            detected_rows_meta.append(
+                {
+                    "df_row_idx": r,
+                    "csv_row_num": r + 2,
+                    "meta_type": explicit_type,
+                    "has_explicit_keyword": True,
+                    "keyword_label": first_str,
+                }
+            )
+            assigned_types.add(explicit_type)
+            meta_end_idx = r + 1
+            continue
+
+        # 2) 상단 비수치 텍스트 행 휴리스틱 검사
+        has_any_datetime = any(
+            _looks_like_datetime_scalar(row.iloc[i]) for i in range(len(row))
+        )
+        if has_any_datetime:
+            break
+
+        time_header_words = {"time", "date", "timestamp", "datetime", "일시", "시간", "시각", "일자"}
+        start_col_for_heur = (
+            1
+            if (
+                len(row) > 1
+                and (
+                    not first_str
+                    or first_str.lower() in placeholder_tokens
+                    or first_str.lower() in time_header_words
+                )
+            )
+            else 0
+        )
+        heur_valid: List[str] = []
+        for i in range(start_col_for_heur, len(row)):
+            v = row.iloc[i]
+            if v is None or pd.isna(v):
+                continue
+            sv = str(v).strip()
+            if sv.lower() not in placeholder_tokens:
+                heur_valid.append(sv)
+
+        if not heur_valid:
+            break
+
+        heur_num_cnt = sum(
+            1 for sv in heur_valid if not math.isnan(_coerce_numeric_scalar(sv))
+        )
+        if (heur_num_cnt / len(heur_valid)) >= 0.2:
+            break
+
+        if body_numeric_col_indices:
+            body_num_in_cur = 0
+            body_non_empty_in_cur = 0
+            for c_idx in body_numeric_col_indices:
+                v = row.iloc[c_idx]
+                if v is not None and not pd.isna(v):
+                    sv = str(v).strip()
+                    if sv.lower() not in placeholder_tokens:
+                        body_non_empty_in_cur += 1
+                        if not math.isnan(_coerce_numeric_scalar(sv)):
+                            body_num_in_cur += 1
+            if body_non_empty_in_cur > 0 and (body_num_in_cur / body_non_empty_in_cur) >= 0.2:
+                break
+
+        cat_match_cnt = sum(1 for sv in heur_valid if bool(normalize_category_token(sv)))
+        unit_match_cnt = sum(1 for sv in heur_valid if _looks_like_unit_value(sv))
+        cat_ratio = cat_match_cnt / len(heur_valid)
+        unit_ratio = unit_match_cnt / len(heur_valid)
+
+        if not body_numeric_col_indices and cat_ratio < 0.5 and unit_ratio < 0.5:
+            break
+
+        if cat_ratio >= 0.5 and "category" not in assigned_types:
+            inferred_type = "category"
+        elif unit_ratio >= 0.5 and "unit" not in assigned_types:
+            inferred_type = "unit"
+        elif "name" not in assigned_types:
+            inferred_type = "name"
+        elif "unit" not in assigned_types:
+            inferred_type = "unit"
+        else:
+            inferred_type = "name"
+
+        detected_rows_meta.append(
+            {
+                "df_row_idx": r,
+                "csv_row_num": r + 2,
+                "meta_type": inferred_type,
+                "has_explicit_keyword": False,
+                "keyword_label": first_str or "비수치 텍스트 자동감지",
+            }
+        )
+        assigned_types.add(inferred_type)
+        meta_end_idx = r + 1
+
+    if meta_end_idx == 0:
+        return df, {}, empty_info
+
+    col_metadata: Dict[str, Dict[str, str]] = {}
+    for col_idx, col_name in enumerate(df.columns):
+        col_str = str(col_name)
+        name_val = ""
+        unit_val = ""
+        cat_val = ""
+
+        for m_info in detected_rows_meta:
+            r_idx = m_info["df_row_idx"]
+            m_type = m_info["meta_type"]
+            if col_idx == 0 and m_info["has_explicit_keyword"]:
+                continue
+
+            raw_cell = df.iloc[r_idx, col_idx]
+            if raw_cell is None or pd.isna(raw_cell):
+                continue
+            cell_str = str(raw_cell).strip()
+            if not cell_str or cell_str.lower() in placeholder_tokens:
+                continue
+
+            if m_type == "name" and not name_val:
+                name_val = cell_str
+            elif m_type == "unit" and not unit_val:
+                unit_val = cell_str
+            elif m_type == "category" and not cat_val:
+                norm_cat = normalize_category_token(cell_str)
+                if norm_cat:
+                    cat_val = norm_cat
+
+        if name_val or unit_val or cat_val:
+            col_metadata[col_str] = {
+                "name": name_val,
+                "unit": unit_val,
+                "category": cat_val,
+            }
+
+    data_df = df.iloc[meta_end_idx:].reset_index(drop=True)
+    data_df = _restore_standard_numeric_dtypes(data_df)
+
+    type_kor_map = {
+        "name": "한글명",
+        "unit": "단위",
+        "category": "분류",
+    }
+    parse_info: Dict[str, Any] = {
+        "meta_row_count": meta_end_idx,
+        "detected_rows": [
+            {
+                "csv_row_num": m["csv_row_num"],
+                "meta_type": m["meta_type"],
+                "meta_type_kor": type_kor_map.get(m["meta_type"], m["meta_type"]),
+                "keyword_label": m["keyword_label"],
+                "has_explicit_keyword": m["has_explicit_keyword"],
+            }
+            for m in detected_rows_meta
+        ],
+    }
+    return data_df, col_metadata, parse_info
+
+
+def get_active_csv_tag_metadata(
+    raw_col_meta: Optional[Dict[str, Dict[str, str]]],
+    time_col: Optional[str],
+    unit_hints: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, str]]:
+    """
+    시간 기준 컬럼(time_col)을 제외하고, CSV 내장 메타데이터와 Phase 5 '%' 단위 힌트를 병합한
+    활성 태그 메타데이터 사전({tag: {name, unit, category}})을 반환합니다.
+    """
+    raw_col_meta = raw_col_meta or {}
+    unit_hints = unit_hints or {}
+    time_col_str = str(time_col) if time_col is not None else None
+
+    merged: Dict[str, Dict[str, str]] = {}
+    all_tags = list(raw_col_meta.keys())
+    for h_tag in unit_hints.keys():
+        if h_tag not in raw_col_meta:
+            all_tags.append(h_tag)
+
+    for tag in all_tags:
+        if time_col_str is not None and tag == time_col_str:
+            continue
+        m = raw_col_meta.get(tag, {})
+        name_val = (m.get("name") or "").strip()
+        unit_val = (m.get("unit") or "").strip() or (unit_hints.get(tag) or "").strip()
+        cat_val = normalize_category_token(m.get("category", ""))
+        if name_val or unit_val or cat_val:
+            merged[tag] = {
+                "name": name_val,
+                "unit": unit_val,
+                "category": cat_val,
+            }
+    return merged
+
+
+def build_mapping_from_csv_metadata(
+    columns: List[Any],
+    time_col: Optional[str],
+    raw_col_meta: Optional[Dict[str, Dict[str, str]]],
+    unit_hints: Optional[Dict[str, str]] = None,
+    existing_mapping: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Tuple[Dict[str, List[Dict[str, Any]]], int]:
+    """
+    CSV 내장 메타데이터 중 유효한 분류('feed', 'control', 'state', 'kpi')가 지정된 태그들을
+    Step 2의 4대 변수 매핑 구조로 변환합니다. (단위 미입력 시 Phase 5 '%' 단위 힌트 자동 보완)
+    """
+    raw_col_meta = raw_col_meta or {}
+    unit_hints = unit_hints or {}
+    existing_mapping = existing_mapping or {}
+    time_col_str = str(time_col) if time_col is not None else None
+
+    # 기존 매핑에 입력되어 있던 관리기준(limit_desc) 또는 목표방향/기준값(direction/threshold) 보존용 조회 사전
+    existing_by_cat_tag: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for cat in CATEGORY_KEYS:
+        for item in existing_mapping.get(cat, []):
+            t = (item.get("tag") or "").strip()
+            if t:
+                existing_by_cat_tag[(cat, t)] = item
+
+    new_mapping: Dict[str, List[Dict[str, Any]]] = {cat: [] for cat in CATEGORY_KEYS}
+    seen_in_cat: Dict[str, set] = {cat: set() for cat in CATEGORY_KEYS}
+    classified_count = 0
+
+    for col in columns:
+        tag = str(col).strip()
+        if not tag or (time_col_str is not None and tag == time_col_str):
+            continue
+        meta = raw_col_meta.get(str(col), raw_col_meta.get(tag, {}))
+        if not meta:
+            continue
+        cat = normalize_category_token(meta.get("category", ""))
+        if cat not in CATEGORY_KEYS:
+            continue
+        if tag in seen_in_cat[cat]:
+            continue
+
+        resolved_name = (meta.get("name") or "").strip() or tag
+        resolved_unit = (meta.get("unit") or "").strip() or (unit_hints.get(str(col)) or unit_hints.get(tag) or "").strip()
+        prev_item = existing_by_cat_tag.get((cat, tag), {})
+
+        entry: Dict[str, Any] = {
+            "tag": tag,
+            "name": resolved_name,
+            "unit": resolved_unit,
+        }
+        if cat == "state":
+            entry["limit_desc"] = str(prev_item.get("limit_desc", "") or "").strip()
+        elif cat == "kpi":
+            prev_dir = str(prev_item.get("direction", "maximize") or "maximize").strip().lower()
+            entry["direction"] = prev_dir if prev_dir in ("maximize", "minimize") else "maximize"
+            try:
+                entry["threshold"] = float(prev_item.get("threshold", 0.1))
+            except (ValueError, TypeError):
+                entry["threshold"] = 0.1
+
+        new_mapping[cat].append(entry)
+        seen_in_cat[cat].add(tag)
+        classified_count += 1
+
+    return new_mapping, classified_count
+
+
+def format_csv_column_with_meta(
+    col_name: str,
+    raw_col_meta: Optional[Dict[str, Dict[str, str]]],
+    unit_hints: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    Step 2의 [⚡ CSV 컬럼 빠른 분류 도우미]에서 컬럼 선택 항목을
+    '태그명 — 한글명 [단위]' (또는 한글명/단위 유무에 따른 깔끔한 형태)로 표시합니다.
+    """
+    raw_col_meta = raw_col_meta or {}
+    unit_hints = unit_hints or {}
+    meta = raw_col_meta.get(col_name, {})
+
+    kor_name = (meta.get("name") or "").strip()
+    unit_val = (meta.get("unit") or "").strip() or (unit_hints.get(col_name) or "").strip()
+
+    has_distinct_name = bool(kor_name and kor_name != col_name)
+    if has_distinct_name and unit_val:
+        return f"{col_name} — {kor_name} [{unit_val}]"
+    if has_distinct_name:
+        return f"{col_name} — {kor_name}"
+    if unit_val:
+        return f"{col_name} [{unit_val}]"
+    return col_name
+
+
+def generate_multi_header_template_csv_bytes(
+    process_name: str,
+    raw_df: Optional[pd.DataFrame],
+    time_col: Optional[str],
+    var_mapping: Optional[Dict[str, List[Dict[str, Any]]]],
+    raw_col_meta: Optional[Dict[str, Dict[str, str]]] = None,
+    unit_hints: Optional[Dict[str, str]] = None,
+) -> Tuple[bytes, str]:
+    """
+    현재 로드된 CSV 컬럼(또는 현재 매핑 정보 / 샘플 데이터)을 기반으로
+    엑셀에서 한글명·단위·분류를 쉽게 기입·저장할 수 있는 다중 헤더 메타데이터 템플릿 CSV(UTF-8-SIG BOM 포함)를 생성합니다.
+    """
+    var_mapping = var_mapping or {}
+    raw_col_meta = raw_col_meta or {}
+    unit_hints = unit_hints or {}
+
+    mapped_lookup: Dict[str, Dict[str, str]] = {}
+    for cat in CATEGORY_KEYS:
+        for item in var_mapping.get(cat, []):
+            t = (item.get("tag") or "").strip()
+            if t and t not in mapped_lookup:
+                mapped_lookup[t] = {
+                    "name": (item.get("name") or "").strip(),
+                    "unit": (item.get("unit") or "").strip(),
+                    "category": cat,
+                }
+
+    # 1) 현재 로드된 CSV가 있는 경우: 실제 CSV 컬럼과 데이터 행(최대 5,000행)을 그대로 유지하여 즉시 재업로드 가능하도록 구성
+    if raw_df is not None and not raw_df.empty:
+        effective_time_col = (
+            time_col
+            if (time_col is not None and time_col in raw_df.columns)
+            else detect_time_column(raw_df)
+        )
+        if effective_time_col is not None and effective_time_col in raw_df.columns:
+            ordered_cols = [effective_time_col] + [
+                c for c in raw_df.columns if c != effective_time_col
+            ]
+        else:
+            ordered_cols = list(raw_df.columns)
+            effective_time_col = None
+
+        header_row = [str(c) for c in ordered_cols]
+        name_row: List[str] = []
+        unit_row: List[str] = []
+        cat_row: List[str] = []
+
+        for idx, col in enumerate(ordered_cols):
+            col_s = str(col)
+            if idx == 0 and effective_time_col is not None and col == effective_time_col:
+                name_row.append("한글명")
+                unit_row.append("단위")
+                cat_row.append("분류")
+            else:
+                m_cur = mapped_lookup.get(col_s, {})
+                m_csv = raw_col_meta.get(col_s, {})
+
+                cur_name = m_cur.get("name", "")
+                csv_name = m_csv.get("name", "")
+                if cur_name and cur_name != col_s:
+                    resolved_name = cur_name
+                elif csv_name:
+                    resolved_name = csv_name
+                else:
+                    resolved_name = ""
+
+                resolved_unit = (
+                    m_cur.get("unit")
+                    or m_csv.get("unit")
+                    or unit_hints.get(col_s, "")
+                )
+                resolved_cat = m_cur.get("category") or normalize_category_token(
+                    m_csv.get("category", "")
+                )
+
+                name_row.append(resolved_name)
+                unit_row.append(resolved_unit)
+                cat_row.append(resolved_cat)
+
+        subset_df = raw_df.head(5000)[ordered_cols]
+        data_rows: List[List[str]] = []
+        for _, r in subset_df.iterrows():
+            row_vals: List[str] = []
+            for v in r.tolist():
+                if v is None or pd.isna(v):
+                    row_vals.append("")
+                elif isinstance(v, pd.Timestamp):
+                    row_vals.append(v.strftime("%Y-%m-%d %H:%M:%S"))
+                else:
+                    row_vals.append(str(v))
+            data_rows.append(row_vals)
+
+    # 2) 아직 CSV를 로드하지 않았지만 Step 2 매핑 정보(프리셋 등)가 있는 경우
+    elif mapped_lookup:
+        tag_list = list(mapped_lookup.keys())
+        header_row = ["Timestamp"] + tag_list
+        name_row = ["한글명"] + [mapped_lookup[t]["name"] for t in tag_list]
+        unit_row = ["단위"] + [mapped_lookup[t]["unit"] for t in tag_list]
+        cat_row = ["분류"] + [mapped_lookup[t]["category"] for t in tag_list]
+        data_rows = [
+            ["2026-05-01 00:00:00"] + ["" for _ in tag_list],
+            ["2026-05-01 01:00:00"] + ["" for _ in tag_list],
+        ]
+
+    # 3) CSV도 없고 매핑도 비어 있는 초기 상태: NCC 공정 대표 예시 템플릿 제공
+    else:
+        sample_df = create_sample_ncc_dataframe().head(5)
+        sample_map = get_sample_ncc_mapping()
+        sample_lookup: Dict[str, Dict[str, str]] = {}
+        for cat in CATEGORY_KEYS:
+            for item in sample_map.get(cat, []):
+                sample_lookup[item["tag"]] = {
+                    "name": item.get("name", ""),
+                    "unit": item.get("unit", ""),
+                    "category": cat,
+                }
+        ordered_cols = list(sample_df.columns)
+        header_row = [str(c) for c in ordered_cols]
+        name_row = ["한글명"] + [sample_lookup.get(str(c), {}).get("name", "") for c in ordered_cols[1:]]
+        unit_row = ["단위"] + [sample_lookup.get(str(c), {}).get("unit", "") for c in ordered_cols[1:]]
+        cat_row = ["분류"] + [sample_lookup.get(str(c), {}).get("category", "") for c in ordered_cols[1:]]
+        data_rows = [
+            ["" if pd.isna(v) else str(v) for v in r.tolist()]
+            for _, r in sample_df.iterrows()
+        ]
+
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    writer.writerow(header_row)
+    writer.writerow(name_row)
+    writer.writerow(unit_row)
+    writer.writerow(cat_row)
+    writer.writerows(data_rows)
+
+    clean_proc = re.sub(r'[\\/:*?"<>|]+', "_", (process_name or "").strip()) or "process"
+    filename = f"{clean_proc}_다중헤더_메타데이터_템플릿.csv"
+    return buf.getvalue().encode("utf-8-sig"), filename
 
 
 def diagnose_dataframe_quality(
@@ -1579,7 +2376,11 @@ def render_step1() -> None:
             type=["csv", "CSV"],
         )
         if uploaded_file is not None:
-            current_file_id = f"upload::{uploaded_file.name}::{uploaded_file.size}"
+            file_bytes = uploaded_file.getvalue()
+            content_hash = hashlib.md5(file_bytes).hexdigest()[:12]
+            current_file_id = (
+                f"upload::{uploaded_file.name}::{uploaded_file.size}::{content_hash}"
+            )
             if st.session_state["loaded_file_id"] != current_file_id:
                 try:
                     loaded_df = load_csv_safely(uploaded_file)
@@ -1608,17 +2409,34 @@ def render_step1() -> None:
                     except Exception as exc:
                         st.error(f"NAS CSV 파일 로드 중 오류가 발생했습니다: {exc}")
 
-    # 새 파일이 로드되었을 때 비표준 수치 문자열(%, 콤마 등) 정제 및 품질 사전 진단 후 세션 상태 갱신
+    # 새 파일이 로드되었을 때: 선택형 다중 헤더 메타데이터 분리 -> 비표준 수치 문자열 정제 -> 품질 사전 진단 -> Step 2 자동 연동
     if loaded_df is not None and current_file_id is not None:
-        detected_col = detect_time_column(loaded_df)
+        data_only_df, col_metadata, meta_parse_info = parse_csv_with_optional_metadata(
+            loaded_df
+        )
+        detected_col = detect_time_column(data_only_df)
         cleaned_df, clean_report, unit_hints = clean_nonstandard_numeric_columns(
-            loaded_df, time_col=detected_col
+            data_only_df, time_col=detected_col
         )
         quality_report = diagnose_dataframe_quality(cleaned_df, time_col=detected_col)
+
+        # CSV 내장 메타데이터에 유효한 변수 분류(feed/control/state/kpi)가 있으면 Step 2 매핑 표에 즉시 자동 배치
+        auto_mapping, auto_classified_cnt = build_mapping_from_csv_metadata(
+            columns=list(cleaned_df.columns),
+            time_col=detected_col,
+            raw_col_meta=col_metadata,
+            unit_hints=unit_hints,
+        )
+        meta_parse_info["auto_classified_count"] = auto_classified_cnt
+        if auto_classified_cnt > 0:
+            st.session_state["var_mapping"] = auto_mapping
+            sync_editor_base_dfs_from_mapping()
 
         st.session_state["raw_df"] = cleaned_df
         st.session_state["loaded_file_id"] = current_file_id
         st.session_state["time_col"] = detected_col
+        st.session_state["csv_tag_metadata"] = col_metadata
+        st.session_state["csv_meta_parse_info"] = meta_parse_info
         st.session_state["numeric_clean_report"] = clean_report
         st.session_state["inferred_unit_hints"] = unit_hints
         st.session_state["data_quality_report"] = quality_report
@@ -1632,6 +2450,110 @@ def render_step1() -> None:
         )
         st.session_state["processed_df"] = proc_df
         st.session_state["resample_summary_msg"] = msg
+
+    # 다중 헤더(한글명·단위·분류 선택형 메타데이터) 작성 가이드 및 엑셀 편집용 템플릿 다운로드 도우미
+    tpl_cache_sig = json.dumps(
+        {
+            "file_id": st.session_state.get("loaded_file_id"),
+            "process_name": st.session_state.get("process_name", ""),
+            "time_col": str(st.session_state.get("time_col")),
+            "var_mapping": st.session_state.get("var_mapping", {}),
+            "has_raw_df": st.session_state.get("raw_df") is not None,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    if st.session_state.get("_tpl_csv_cache_sig") != tpl_cache_sig:
+        tpl_bytes, tpl_filename = generate_multi_header_template_csv_bytes(
+            process_name=st.session_state.get("process_name", ""),
+            raw_df=st.session_state.get("raw_df"),
+            time_col=st.session_state.get("time_col"),
+            var_mapping=st.session_state.get("var_mapping"),
+            raw_col_meta=st.session_state.get("csv_tag_metadata"),
+            unit_hints=st.session_state.get("inferred_unit_hints"),
+        )
+        st.session_state["_tpl_csv_cache_sig"] = tpl_cache_sig
+        st.session_state["_tpl_csv_cache_bytes"] = tpl_bytes
+        st.session_state["_tpl_csv_cache_name"] = tpl_filename
+
+    guide_col1, guide_col2, guide_col3 = st.columns([2.1, 1.15, 1.35])
+    with guide_col1:
+        st.caption(
+            "💡 **기존 `1행 태그명 + 데이터` 일반 CSV도 별도 설정 없이 그대로 작동**합니다. "
+            "초기 프리셋 세팅 시 엑셀에서 2~4행에 **`한글명` · `단위` · `분류`**를 선택적으로 추가해 올리면 Step 2에 자동 인식·연동됩니다."
+        )
+    with guide_col2:
+        with st.popover(
+            "❓ 다중 헤더(한글명·단위·분류) 작성 안내", use_container_width=True
+        ):
+            st.markdown(
+                """
+                **✅ 1. 기본 1줄 헤더 CSV 100% 호환 (메타 행 전부 선택 사항)**
+                - 기존처럼 **`1행 태그명 + 2행부터 시계열 데이터`**만 있는 일반 CSV를 올려도 아무 설정 없이 그대로 정상 동작합니다.
+                - 초기 프리셋 세팅을 빠르게 하고 싶을 때만 **2~4행에 `한글명` · `단위` · `분류` 행을 선택적으로 추가**하세요.
+                - **3가지 행을 모두 넣거나, 일부 행만(예: `한글명`+`단위`만), 또는 일부 컬럼만 채워도** 시계열 데이터와 자동 분리됩니다.
+
+                **✅ 2. 엑셀 작성 예시 (첫 번째 컬럼에 식별 키워드 권장)**
+                | `Timestamp` *(1행: 태그명)* | `FI-101` | `COT` | `PDI-205` | `C2_YIELD` |
+                | :--- | :--- | :--- | :--- | :--- |
+                | **`한글명`** *(선택)* | 나프타 유량 | 열분해로 출구온도 | 코킹 차압 | 에틸렌 수율 |
+                | **`단위`** *(선택)* | `t/h` | `°C` | `bar` | `%` |
+                | **`분류`** *(선택)* | `feed` | `control` | `state` | `kpi` |
+                | `2026-05-01 00:00` | `45.0` | `834.0` | `0.38` | `31.80` |
+                | `2026-05-01 01:00` | `45.1` | `838.5` | `0.40` | `32.25` |
+
+                - **식별 키워드(대소문자 무관)**:
+                  - 한글명 행: `한글명`, `명칭`, `이름`, `name`, `desc`, `description`
+                  - 단위 행: `단위`, `unit`, `units`, `uom`
+                  - 분류 행: `분류`, `변수분류`, `역할`, `category`, `role`, `type` 👉 값으로 **`feed`, `control`, `state`, `kpi`** 입력 시 Step 2 매핑 표에 자동 배치!
+                - **빠른 작성 팁**: 먼저 일반 CSV를 업로드한 뒤 우측 **[📥 다중 헤더 메타데이터 템플릿 CSV 다운로드]**를 누르면 현재 CSV의 모든 컬럼 상단에 `한글명`·`단위`·`분류` 빈 행이 삽입된 엑셀 호환 파일이 내려받아집니다.
+                """
+            )
+    with guide_col3:
+        st.download_button(
+            label="📥 다중 헤더 메타데이터 템플릿 CSV 다운로드",
+            data=st.session_state["_tpl_csv_cache_bytes"],
+            file_name=st.session_state["_tpl_csv_cache_name"],
+            mime="text/csv",
+            use_container_width=True,
+            help="현재 로드된 CSV 컬럼(또는 현재 Step 2 매핑 정보)을 기반으로 엑셀에서 한글명·단위·분류를 바로 기입해 재업로드할 수 있는 UTF-8(BOM) CSV 템플릿을 다운로드합니다.",
+        )
+
+    # 다중 헤더 메타데이터가 감지된 경우 자동 인식 결과 요약 배너 표시
+    meta_parse_info: Optional[Dict[str, Any]] = st.session_state.get("csv_meta_parse_info")
+    if meta_parse_info and meta_parse_info.get("meta_row_count", 0) > 0:
+        raw_col_meta_cur: Dict[str, Dict[str, str]] = st.session_state.get("csv_tag_metadata") or {}
+        cur_time_col = st.session_state.get("time_col")
+        active_meta_cur = get_active_csv_tag_metadata(
+            raw_col_meta_cur,
+            cur_time_col,
+            st.session_state.get("inferred_unit_hints"),
+        )
+        detected_row_badges = [
+            f"CSV {r['csv_row_num']}행 → **`{r['meta_type_kor']}`** (`{r['keyword_label']}`)"
+            for r in meta_parse_info.get("detected_rows", [])
+        ]
+        named_cnt = sum(1 for v in active_meta_cur.values() if v.get("name"))
+        explicit_unit_cnt = sum(
+            1
+            for k in active_meta_cur.keys()
+            if (raw_col_meta_cur.get(k, {}).get("unit") or "").strip()
+        )
+        cat_cnt = sum(
+            1 for v in active_meta_cur.values() if v.get("category") in CATEGORY_KEYS
+        )
+        if cat_cnt > 0:
+            step2_link_note = (
+                f"분류가 지정된 **`{cat_cnt}`개 태그가 Step 2의 4대 변수 매핑 표에 한글명·단위와 함께 자동 배치**되었습니다!"
+            )
+        else:
+            step2_link_note = (
+                "추출된 한글명·단위 정보가 **Step 2의 `[⚡ CSV 컬럼 빠른 분류 도우미]`에 자동 연동**되었습니다!"
+            )
+        st.success(
+            f"🏷️ **다중 헤더 CSV 메타데이터 자동 인식 완료** ({', '.join(detected_row_badges)} 분리 완료)\n\n"
+            f"- 추출된 태그 메타정보: **한글명 `{named_cnt}`개** · **단위 `{explicit_unit_cnt}`개** · **변수분류 `{cat_cnt}`개**  |  👉 {step2_link_note}"
+        )
 
     # 비표준 수치 문자열 자동 정제 및 데이터 품질 사전 진단 안내 표시
     clean_report: Dict[str, Dict[str, Any]] = st.session_state.get("numeric_clean_report") or {}
@@ -1941,11 +2863,94 @@ def render_step2() -> None:
         st.rerun()
 
     # --------------------------------------------------------------------------
-    # 2) CSV 로드 시: 컬럼 빠른 분류 도우미 (선택 사항)
+    # 2) CSV 내장 메타데이터 연동 바 & 컬럼 빠른 분류 도우미
     # --------------------------------------------------------------------------
     proc_df = st.session_state.get("processed_df")
     time_col = st.session_state.get("time_col")
+    raw_col_meta: Dict[str, Dict[str, str]] = st.session_state.get("csv_tag_metadata") or {}
+    unit_hints: Dict[str, str] = st.session_state.get("inferred_unit_hints") or {}
     candidate_csv_cols: List[str] = []
+
+    if raw_col_meta:
+        active_csv_meta = get_active_csv_tag_metadata(raw_col_meta, time_col, unit_hints)
+        if active_csv_meta:
+            m_name_cnt = sum(1 for v in active_csv_meta.values() if v.get("name"))
+            m_unit_cnt = sum(
+                1
+                for k in active_csv_meta.keys()
+                if (raw_col_meta.get(k, {}).get("unit") or "").strip()
+            )
+            m_cat_cnt = sum(
+                1 for v in active_csv_meta.values() if v.get("category") in CATEGORY_KEYS
+            )
+            with st.container(border=True):
+                mc_col1, mc_col2 = st.columns([3.2, 1.1])
+                with mc_col1:
+                    st.markdown(
+                        f"🏷️ **현재 CSV 내장 메타데이터 감지됨** — "
+                        f"한글명 **`{m_name_cnt}`개** · 단위 **`{m_unit_cnt}`개** · 변수분류 **`{m_cat_cnt}`개**\n\n"
+                        f"<span style='font-size:0.88em; color:gray;'>"
+                        f"{'프리셋을 불러오거나 초기화한 뒤에도 우측 버튼으로 CSV 내장 분류·명칭·단위를 다시 적용할 수 있습니다.' if m_cat_cnt > 0 else '분류 미지정 태그는 아래 [⚡ CSV 컬럼 빠른 분류 도우미]에서 선택 시 한글명·단위가 자동으로 채워집니다.'}"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+                with mc_col2:
+                    reapply_csv_meta_clicked = st.button(
+                        "✨ CSV 내장 메타데이터 다시 적용",
+                        use_container_width=True,
+                        help="CSV 2~4행에서 추출된 변수분류·한글명·단위 메타데이터를 아래 4대 변수 매핑 표에 다시 적용합니다.",
+                    )
+
+                if reapply_csv_meta_clicked:
+                    cols_source = (
+                        list(proc_df.columns)
+                        if (proc_df is not None and not proc_df.empty)
+                        else list(raw_col_meta.keys())
+                    )
+                    if m_cat_cnt > 0:
+                        reapplied_map, applied_cnt = build_mapping_from_csv_metadata(
+                            columns=cols_source,
+                            time_col=time_col,
+                            raw_col_meta=raw_col_meta,
+                            unit_hints=unit_hints,
+                            existing_mapping=st.session_state.get("var_mapping"),
+                        )
+                        st.session_state["var_mapping"] = reapplied_map
+                        sync_editor_base_dfs_from_mapping()
+                        counts_str = ", ".join(
+                            f"{k}: {len(reapplied_map.get(k, []))}개" for k in CATEGORY_KEYS
+                        )
+                        st.session_state["preset_flash_type"] = "success"
+                        st.session_state["preset_flash_msg"] = (
+                            f"✨ CSV 내장 메타데이터를 다시 적용하여 총 {applied_cnt}개 변수를 배치했습니다! ({counts_str})"
+                        )
+                        st.rerun()
+                    else:
+                        updated_cnt = 0
+                        cur_map = st.session_state.get("var_mapping", {})
+                        for cat in CATEGORY_KEYS:
+                            for item in cur_map.get(cat, []):
+                                t = (item.get("tag") or "").strip()
+                                if t and t in active_csv_meta:
+                                    m_info = active_csv_meta[t]
+                                    if m_info.get("name"):
+                                        item["name"] = m_info["name"]
+                                    if m_info.get("unit"):
+                                        item["unit"] = m_info["unit"]
+                                    updated_cnt += 1
+                        if updated_cnt > 0:
+                            sync_editor_base_dfs_from_mapping()
+                            st.session_state["preset_flash_type"] = "success"
+                            st.session_state["preset_flash_msg"] = (
+                                f"✨ 현재 매핑된 변수 {updated_cnt}개에 CSV 내장 한글명·단위 정보를 업데이트했습니다!"
+                            )
+                        else:
+                            st.session_state["preset_flash_type"] = "warning"
+                            st.session_state["preset_flash_msg"] = (
+                                "💡 현재 CSV에는 '분류(feed/control/state/kpi)' 행이 없고 한글명/단위만 포함되어 있습니다. "
+                                "아래 [⚡ CSV 컬럼 빠른 분류 도우미]에서 태그를 선택해 추가하면 한글명과 단위가 자동 입력됩니다."
+                            )
+                        st.rerun()
 
     if proc_df is not None and not proc_df.empty:
         candidate_csv_cols = [str(c) for c in proc_df.columns if c != time_col]
@@ -1956,21 +2961,31 @@ def render_step2() -> None:
             if item.get("tag", "").strip()
         }
         unmapped_cols = [c for c in candidate_csv_cols if c not in mapped_tags]
+        ordered_candidate_cols = unmapped_cols + [
+            c for c in candidate_csv_cols if c in mapped_tags
+        ]
+        has_unmapped_csv_meta = any(
+            bool((raw_col_meta.get(c, {}).get("name") or "").strip() or (raw_col_meta.get(c, {}).get("unit") or "").strip())
+            for c in unmapped_cols
+        )
 
         with st.expander(
             f"⚡ CSV 컬럼 빠른 분류 도우미 (전체 후보 컬럼 {len(candidate_csv_cols)}개 중 미분류 {len(unmapped_cols)}개)",
-            expanded=False,
+            expanded=has_unmapped_csv_meta,
         ):
             st.caption(
                 "현재 로드된 CSV 파일의 컬럼을 선택하여 원하는 변수 카테고리 표에 한 번에 추가할 수 있습니다. "
-                "(물론 아래 표에서 직접 `+` 버튼을 눌러 태그명을 타이핑하셔도 됩니다.)"
+                "CSV에 내장된 한글명·단위(및 `%` 단위 힌트)가 있으면 `태그명 — 한글명 [단위]`로 표시되며 추가 시 자동으로 채워집니다."
             )
             q_col1, q_col2, q_col3 = st.columns([2.2, 1.2, 0.8])
             with q_col1:
                 cols_to_add = st.multiselect(
                     "추가할 CSV 컬럼 선택",
-                    options=candidate_csv_cols,
+                    options=ordered_candidate_cols,
                     default=[],
+                    format_func=lambda col_key: format_csv_column_with_meta(
+                        col_key, raw_col_meta, unit_hints
+                    ),
                     placeholder="CSV 컬럼을 하나 이상 선택하세요...",
                 )
             with q_col2:
@@ -2002,15 +3017,21 @@ def render_step2() -> None:
                 target_cat = cat_map[target_cat_label]
                 existing_items = list(st.session_state["var_mapping"].get(target_cat, []))
                 existing_tags = {item.get("tag", "") for item in existing_items}
-                unit_hints: Dict[str, str] = st.session_state.get("inferred_unit_hints") or {}
 
                 added_count = 0
+                auto_filled_meta_cnt = 0
                 for col_name in cols_to_add:
                     if col_name not in existing_tags:
+                        c_meta = raw_col_meta.get(col_name, {})
+                        meta_kor_name = (c_meta.get("name") or "").strip()
+                        meta_unit_val = (c_meta.get("unit") or "").strip() or unit_hints.get(col_name, "")
+                        if meta_kor_name or meta_unit_val:
+                            auto_filled_meta_cnt += 1
+
                         new_entry: Dict[str, Any] = {
                             "tag": col_name,
-                            "name": col_name,
-                            "unit": unit_hints.get(col_name, ""),
+                            "name": meta_kor_name or col_name,
+                            "unit": meta_unit_val,
                         }
                         if target_cat == "state":
                             new_entry["limit_desc"] = ""
@@ -2023,9 +3044,15 @@ def render_step2() -> None:
                 st.session_state["var_mapping"][target_cat] = existing_items
                 sync_editor_base_dfs_from_mapping()
                 st.session_state["preset_flash_type"] = "success"
-                st.session_state["preset_flash_msg"] = (
-                    f"✅ 선택한 컬럼 {added_count}개를 `{target_cat}` 카테고리에 추가했습니다. 한글 명칭과 단위를 입력해 주세요."
-                )
+                if auto_filled_meta_cnt > 0:
+                    st.session_state["preset_flash_msg"] = (
+                        f"✅ 선택한 컬럼 {added_count}개를 `{target_cat}` 카테고리에 추가했습니다 "
+                        f"(내장 한글명/단위 자동 반영 {auto_filled_meta_cnt}개)."
+                    )
+                else:
+                    st.session_state["preset_flash_msg"] = (
+                        f"✅ 선택한 컬럼 {added_count}개를 `{target_cat}` 카테고리에 추가했습니다. 한글 명칭과 단위를 입력해 주세요."
+                    )
                 st.rerun()
 
     # --------------------------------------------------------------------------
@@ -2464,6 +3491,8 @@ def render_step3() -> None:
         st.session_state["raw_df"] = sample_df
         st.session_state["loaded_file_id"] = "builtin_sample_ncc_csv"
         st.session_state["time_col"] = "Timestamp"
+        st.session_state["csv_tag_metadata"] = {}
+        st.session_state["csv_meta_parse_info"] = None
         st.session_state["numeric_clean_report"] = {}
         st.session_state["inferred_unit_hints"] = {}
         st.session_state["data_quality_report"] = diagnose_dataframe_quality(
