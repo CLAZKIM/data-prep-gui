@@ -255,6 +255,10 @@ def init_session_state() -> None:
         "resample_rule": "원본 유지(집계 안 함)",
         "resample_agg": "평균값(mean)",
         "resample_summary_msg": None,
+        # Phase 5: 비표준 수치 문자열 정제 및 데이터 품질 사전 진단 상태
+        "inferred_unit_hints": {},
+        "numeric_clean_report": {},
+        "data_quality_report": None,
         # Phase 2: 4대 공정 변수 매핑 상태
         "var_mapping": {
             "feed": [],
@@ -295,6 +299,53 @@ def init_session_state() -> None:
 # ==============================================================================
 # 1. 유틸리티 함수 (CSV 로드, 시간 컬럼 감지, 시계열 리샘플링, YAML 프리셋, 골든 케이스 추출/문장 생성)
 # ==============================================================================
+def _is_hidden_or_temp_name(name: str) -> bool:
+    """
+    macOS(.DS_Store, ._*) 및 시놀로지 NAS(@eaDir, #recycle), 엑셀 임시 파일(~$*) 등
+    숨김/임시 파일 또는 폴더인지 판별합니다.
+    """
+    if not name:
+        return True
+    if name.startswith(".") or name.startswith("~$"):
+        return True
+    if name in ("@eaDir", "#recycle", "__MACOSX"):
+        return True
+    return False
+
+
+def _is_valid_relative_path(rel_path: Path) -> bool:
+    """상대 경로의 모든 상위 폴더 및 파일명에 숨김/임시 항목이 없는지 확인합니다."""
+    return not any(_is_hidden_or_temp_name(part) for part in rel_path.parts)
+
+
+def list_nas_csv_files(base_dir: Optional[str] = None) -> List[str]:
+    """
+    ./nas_archive (또는 NAS_ARCHIVE_DIR) 및 하위 폴더를 재귀적으로 탐색하여
+    확장자 대소문자 무관(.csv, .CSV, .Csv 등)하게 모든 CSV 파일의 상대 경로 목록을 반환합니다.
+    macOS 및 시놀로지 NAS의 숨김/임시 파일(._*, .DS_Store, ~$* 등)과 숨김 폴더 내부는 자동 제외합니다.
+    """
+    ensure_directories()
+    root_path = Path(base_dir or NAS_ARCHIVE_DIR)
+    if not root_path.exists():
+        return []
+
+    rel_files: List[str] = []
+    for p in root_path.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() != ".csv":
+            continue
+        try:
+            rel_path = p.relative_to(root_path)
+        except ValueError:
+            continue
+        if not _is_valid_relative_path(rel_path):
+            continue
+        rel_files.append(rel_path.as_posix())
+
+    return sorted(set(rel_files), key=lambda s: s.lower())
+
+
 def load_csv_safely(file_source) -> pd.DataFrame:
     """인코딩(utf-8, utf-8-sig, cp949, euc-kr)을 순차 시도하여 CSV를 안전하게 로드합니다."""
     encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
@@ -329,9 +380,12 @@ def detect_time_column(df: pd.DataFrame) -> Optional[str]:
 
     # 3순위: 문자열/객체 컬럼 중 상위 샘플이 날짜/시간으로 파싱 가능한 컬럼
     for col in df.columns:
-        if df[col].dtype == "object":
-            sample = df[col].dropna().head(10)
+        if pd.api.types.is_string_dtype(df[col]) or pd.api.types.is_object_dtype(df[col]):
+            sample = df[col].dropna().astype(str).str.strip().head(10)
             if len(sample) > 0:
+                # 백분율(%)이나 단순 수치 문자열이 날짜로 오인되는 것 방지
+                if sample.str.endswith("%").any():
+                    continue
                 try:
                     pd.to_datetime(sample, errors="raise")
                     return col
@@ -339,6 +393,178 @@ def detect_time_column(df: pd.DataFrame) -> Optional[str]:
                     continue
 
     return df.columns[0] if len(df.columns) > 0 else None
+
+
+def _coerce_numeric_series(s: pd.Series) -> pd.Series:
+    """
+    시리즈가 수치형이면 그대로 반환하고, 문자열(object/string)인 경우
+    백분율 기호('%'), 천단위 콤마(','), 앞뒤 공백을 제거한 뒤 float64로 안전하게 변환합니다.
+    """
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    s_str = s.astype(str).str.strip()
+    s_cleaned = (
+        s_str.str.replace("%", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+    s_cleaned = s_cleaned.where(s.notna(), other=None)
+    return pd.to_numeric(s_cleaned, errors="coerce")
+
+
+def _coerce_numeric_scalar(val: Any) -> float:
+    """단일 스칼라 값에서 '%', ',' 등을 제거하고 float로 변환합니다 (변환 불가 시 nan 반환)."""
+    if val is None or pd.isna(val):
+        return float("nan")
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        cleaned = str(val).strip().replace("%", "").replace(",", "").strip()
+        if not cleaned:
+            return float("nan")
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return float("nan")
+
+
+def clean_nonstandard_numeric_columns(
+    df: pd.DataFrame,
+    time_col: Optional[str] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """
+    시간 기준 컬럼 외 문자열(object/string) 컬럼 중 "89.4%"(백분율 % 포함),
+    "5,519.27"(천단위 콤마 , 포함), 앞뒤 공백 등이 포함된 수치형 후보 컬럼을 자동 감지하여
+    float64로 정제 변환합니다.
+    - 반환값: (정제된 DataFrame, 정제 리포트 사전, '%' 제거 컬럼 기본 단위 힌트 사전)
+    """
+    if df is None or df.empty:
+        return df, {}, {}
+
+    cleaned_df = df.copy()
+    clean_report: Dict[str, Dict[str, Any]] = {}
+    unit_hints: Dict[str, str] = {}
+
+    placeholder_tokens = {"", "-", "nan", "none", "null", "n/a", "na"}
+
+    for col in cleaned_df.columns:
+        if time_col is not None and col == time_col:
+            continue
+
+        s = cleaned_df[col]
+        if (
+            pd.api.types.is_numeric_dtype(s)
+            or pd.api.types.is_datetime64_any_dtype(s)
+            or pd.api.types.is_bool_dtype(s)
+        ):
+            continue
+
+        if not (pd.api.types.is_string_dtype(s) or pd.api.types.is_object_dtype(s)):
+            continue
+
+        non_null = s.dropna().astype(str).str.strip()
+        valid_str = non_null[~non_null.str.lower().isin(placeholder_tokens)]
+        if valid_str.empty:
+            continue
+
+        # 날짜/시간 형식의 문자열 컬럼은 수치 변환 대상에서 제외
+        sample_head = valid_str.head(15)
+        looks_like_datetime = (
+            sample_head.str.contains(
+                r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2}", regex=True
+            ).mean()
+            >= 0.5
+        )
+        if looks_like_datetime:
+            continue
+
+        had_percent = bool(valid_str.str.contains("%", regex=False).any())
+        had_comma = bool(valid_str.str.contains(",", regex=False).any())
+
+        numeric_s = _coerce_numeric_series(s)
+        valid_indices = valid_str.index
+        converted_count = int(numeric_s.loc[valid_indices].notna().sum())
+        total_valid = len(valid_indices)
+        conversion_ratio = converted_count / total_valid if total_valid > 0 else 0.0
+
+        # 유효 비결측 값의 80% 이상이 수치로 파싱되면 수치형(float64) 컬럼으로 확정 변환
+        if conversion_ratio >= 0.8:
+            cleaned_df[col] = numeric_s.astype("float64")
+            first_idx = valid_indices[0]
+            clean_report[str(col)] = {
+                "had_percent": had_percent,
+                "had_comma": had_comma,
+                "converted_count": converted_count,
+                "total_non_null": total_valid,
+                "sample_before": str(s.loc[first_idx]).strip(),
+                "sample_after": float(numeric_s.loc[first_idx]),
+            }
+            if had_percent:
+                unit_hints[str(col)] = "%"
+
+    return cleaned_df, clean_report, unit_hints
+
+
+def diagnose_dataframe_quality(
+    df: pd.DataFrame,
+    time_col: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    로드된 CSV 데이터프레임의 품질을 사전 진단합니다:
+    1. 값이 100% 동일한 중복 컬럼 쌍 (동일 헤더 중복으로 인한 .1 접미사 컬럼 및 타 태그명 동일 값 컬럼)
+    2. 전 구간 단일 상수(Constant) 컬럼 (또는 전체 결측 컬럼)
+    """
+    report: Dict[str, Any] = {
+        "duplicate_pairs": [],
+        "constant_cols": [],
+    }
+    if df is None or df.empty or len(df) < 2:
+        return report
+
+    candidate_cols = [c for c in df.columns if c != time_col]
+
+    # 1) 전 구간 단일 상수 컬럼 감지
+    for col in candidate_cols:
+        s = df[col]
+        non_null = s.dropna()
+        if non_null.empty:
+            report["constant_cols"].append(
+                {
+                    "col": str(col),
+                    "constant_value": "전체 결측(NaN)",
+                    "is_all_nan": True,
+                }
+            )
+        elif non_null.nunique(dropna=True) <= 1:
+            val = non_null.iloc[0]
+            report["constant_cols"].append(
+                {
+                    "col": str(col),
+                    "constant_value": _format_num(val, 4),
+                    "is_all_nan": False,
+                }
+            )
+
+    # 2) 값이 100% 동일한 중복 컬럼 쌍 감지
+    n_cols = len(candidate_cols)
+    for i in range(n_cols):
+        col_a = candidate_cols[i]
+        s_a = df[col_a]
+        for j in range(i + 1, n_cols):
+            col_b = candidate_cols[j]
+            s_b = df[col_b]
+            if s_a.equals(s_b):
+                is_suffix_dup = bool(
+                    re.match(rf"^{re.escape(str(col_a))}\.\d+$", str(col_b))
+                )
+                report["duplicate_pairs"].append(
+                    {
+                        "col_a": str(col_a),
+                        "col_b": str(col_b),
+                        "is_suffix_dup": is_suffix_dup,
+                    }
+                )
+
+    return report
 
 
 def perform_resampling(
@@ -443,13 +669,30 @@ def sanitize_preset_filename(process_name: str) -> str:
 
 
 def list_preset_files() -> List[str]:
-    """./presets 폴더 내의 .yaml 및 .yml 파일 목록을 정렬하여 반환합니다."""
+    """
+    ./presets 폴더 내의 YAML 프리셋 파일(.yaml, .yml, .YAML, .YML 등 대소문자 무관) 목록을
+    정렬하여 반환합니다. macOS 및 NAS의 숨김/임시 파일(.DS_Store, ._*, ~$* 등)은 자동 제외합니다.
+    """
     ensure_directories()
-    yaml_files = glob.glob(os.path.join(PRESETS_DIR, "*.yaml")) + glob.glob(
-        os.path.join(PRESETS_DIR, "*.yml")
-    )
-    filenames = sorted({os.path.basename(p) for p in yaml_files})
-    return filenames
+    preset_root = Path(PRESETS_DIR)
+    if not preset_root.exists():
+        return []
+
+    filenames: List[str] = []
+    for p in preset_root.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in (".yaml", ".yml"):
+            continue
+        try:
+            rel_path = p.relative_to(preset_root)
+        except ValueError:
+            continue
+        if not _is_valid_relative_path(rel_path):
+            continue
+        filenames.append(rel_path.as_posix())
+
+    return sorted(set(filenames), key=lambda s: s.lower())
 
 
 def save_preset_to_yaml(
@@ -553,9 +796,9 @@ def _format_num(val: Any, digits: int = 2) -> str:
     if val is None or pd.isna(val):
         return "N/A"
     try:
-        fval = float(val)
+        fval = _coerce_numeric_scalar(val)
         if math.isnan(fval):
-            return "N/A"
+            return str(val)
         if abs(fval - round(fval)) < 1e-9:
             return f"{fval:.1f}"
         return f"{fval:.{digits}f}".rstrip("0").rstrip(".")
@@ -660,12 +903,12 @@ def extract_golden_cases(
         if (item.get("tag") or "").strip() in proc_df.columns
     ]
 
-    # 숫자형 시리즈 사전 변환
+    # 숫자형 시리즈 사전 변환 ('%', ',' 등 비표준 수치 문자열까지 안전하게 정제 변환)
     numeric_cache: Dict[str, pd.Series] = {}
     for item in kpi_items + control_items + state_items:
         tag = item["tag"].strip()
         if tag not in numeric_cache:
-            numeric_cache[tag] = pd.to_numeric(proc_df[tag], errors="coerce")
+            numeric_cache[tag] = _coerce_numeric_series(proc_df[tag])
 
     notes_cache = notes_cache or {}
     golden_rows: List[Dict[str, Any]] = []
@@ -870,8 +1113,8 @@ def build_default_sample_notes(
         c_tag = c0["tag"].strip()
         c_name = (c0.get("name") or c_tag).strip()
         c_unit = (c0.get("unit") or "").strip()
-        v_b = pd.to_numeric(before_s.get(c_tag), errors="coerce")
-        v_a = pd.to_numeric(after_s.get(c_tag), errors="coerce")
+        v_b = _coerce_numeric_scalar(before_s.get(c_tag))
+        v_a = _coerce_numeric_scalar(after_s.get(c_tag))
         if pd.notna(v_b) and pd.notna(v_a):
             diff = float(v_a - v_b)
             act_word = "상향" if diff > 0 else ("하향" if diff < 0 else "유지")
@@ -1035,8 +1278,8 @@ def generate_qa_from_golden_case(
         label = _display_var_label(item)
         unit = (item.get("unit") or "").strip()
         unit_str = f" {unit}" if unit else ""
-        v_b = pd.to_numeric(before_s.get(tag), errors="coerce")
-        v_a = pd.to_numeric(after_s.get(tag), errors="coerce")
+        v_b = _coerce_numeric_scalar(before_s.get(tag))
+        v_a = _coerce_numeric_scalar(after_s.get(tag))
         if pd.notna(v_b) and pd.notna(v_a):
             delta = float(v_a - v_b)
             if abs(delta) < 1e-9:
@@ -1091,8 +1334,8 @@ def generate_qa_from_golden_case(
         unit_str = f" {unit}" if unit else ""
         direction = (item.get("direction") or "maximize").strip().lower()
         thresh = _format_num(item.get("threshold", 0.0), 4)
-        v_b = pd.to_numeric(before_s.get(tag), errors="coerce")
-        v_a = pd.to_numeric(after_s.get(tag), errors="coerce")
+        v_b = _coerce_numeric_scalar(before_s.get(tag))
+        v_a = _coerce_numeric_scalar(after_s.get(tag))
         if pd.notna(v_b) and pd.notna(v_a):
             raw_delta = float(v_a - v_b)
             if direction == "maximize":
@@ -1326,14 +1569,14 @@ def render_step1() -> None:
         )
         st.session_state["source_mode"] = source_mode
 
-    # 2) 파일 로더 처리
+    # 2) 파일 로더 처리 (대소문자 무시 및 NAS 하위 폴더 재귀 탐색 지원)
     loaded_df: Optional[pd.DataFrame] = None
     current_file_id: Optional[str] = None
 
     if source_mode == "① 내 PC에서 CSV 직접 업로드":
         uploaded_file = st.file_uploader(
-            "RTDB 이력 CSV 파일을 업로드하세요 (.csv)",
-            type=["csv"],
+            "RTDB 이력 CSV 파일을 업로드하세요 (.csv / .CSV)",
+            type=["csv", "CSV"],
         )
         if uploaded_file is not None:
             current_file_id = f"upload::{uploaded_file.name}::{uploaded_file.size}"
@@ -1343,22 +1586,20 @@ def render_step1() -> None:
                 except Exception as exc:
                     st.error(f"CSV 파일 로드 중 오류가 발생했습니다: {exc}")
     else:
-        nas_csv_files = sorted(glob.glob(os.path.join(NAS_ARCHIVE_DIR, "*.csv")))
-        if not nas_csv_files:
+        nas_rel_files = list_nas_csv_files(NAS_ARCHIVE_DIR)
+        if not nas_rel_files:
             st.info(
-                f"현재 `{NAS_ARCHIVE_DIR}` 폴더 내에 `.csv` 파일이 없습니다. "
+                f"현재 `{NAS_ARCHIVE_DIR}` 폴더(및 하위 폴더) 내에 `.csv` / `.CSV` 파일이 없습니다. "
                 f"해당 폴더에 CSV 파일을 넣거나 '① 내 PC에서 CSV 직접 업로드'를 이용해 주세요."
             )
         else:
-            file_options = ["-- 파일을 선택하세요 --"] + [
-                os.path.basename(p) for p in nas_csv_files
-            ]
-            selected_name = st.selectbox(
-                f"`{NAS_ARCHIVE_DIR}` 내 CSV 파일 선택",
+            file_options = ["-- 파일을 선택하세요 --"] + nas_rel_files
+            selected_rel_path = st.selectbox(
+                f"`{NAS_ARCHIVE_DIR}` 내 CSV 파일 선택 (하위 폴더 재귀 탐색 · 대소문자 무관)",
                 options=file_options,
             )
-            if selected_name != "-- 파일을 선택하세요 --":
-                selected_path = os.path.join(NAS_ARCHIVE_DIR, selected_name)
+            if selected_rel_path != "-- 파일을 선택하세요 --":
+                selected_path = os.path.join(NAS_ARCHIVE_DIR, selected_rel_path)
                 mtime = os.path.getmtime(selected_path) if os.path.exists(selected_path) else 0
                 current_file_id = f"nas::{selected_path}::{mtime}"
                 if st.session_state["loaded_file_id"] != current_file_id:
@@ -1367,21 +1608,83 @@ def render_step1() -> None:
                     except Exception as exc:
                         st.error(f"NAS CSV 파일 로드 중 오류가 발생했습니다: {exc}")
 
-    # 새 파일이 로드되었을 때 세션 상태 갱신
+    # 새 파일이 로드되었을 때 비표준 수치 문자열(%, 콤마 등) 정제 및 품질 사전 진단 후 세션 상태 갱신
     if loaded_df is not None and current_file_id is not None:
-        st.session_state["raw_df"] = loaded_df
-        st.session_state["loaded_file_id"] = current_file_id
         detected_col = detect_time_column(loaded_df)
+        cleaned_df, clean_report, unit_hints = clean_nonstandard_numeric_columns(
+            loaded_df, time_col=detected_col
+        )
+        quality_report = diagnose_dataframe_quality(cleaned_df, time_col=detected_col)
+
+        st.session_state["raw_df"] = cleaned_df
+        st.session_state["loaded_file_id"] = current_file_id
         st.session_state["time_col"] = detected_col
-        # 기본 상태(원본 유지)로 processed_df 초기화
+        st.session_state["numeric_clean_report"] = clean_report
+        st.session_state["inferred_unit_hints"] = unit_hints
+        st.session_state["data_quality_report"] = quality_report
+
+        # 기본 상태(현재 선택된 집계 주기/함수)로 processed_df 초기화
         proc_df, msg = perform_resampling(
-            loaded_df,
+            cleaned_df,
             detected_col,
             st.session_state["resample_rule"],
             st.session_state["resample_agg"],
         )
         st.session_state["processed_df"] = proc_df
         st.session_state["resample_summary_msg"] = msg
+
+    # 비표준 수치 문자열 자동 정제 및 데이터 품질 사전 진단 안내 표시
+    clean_report: Dict[str, Dict[str, Any]] = st.session_state.get("numeric_clean_report") or {}
+    quality_report: Optional[Dict[str, Any]] = st.session_state.get("data_quality_report")
+    if clean_report or (
+        quality_report
+        and (quality_report.get("duplicate_pairs") or quality_report.get("constant_cols"))
+    ):
+        with st.expander(
+            "🩺 CSV 자동 수치 정제 및 데이터 품질 사전 진단 리포트 (참고용)",
+            expanded=True,
+        ):
+            if clean_report:
+                cleaned_items_desc: List[str] = []
+                for c_name, c_info in clean_report.items():
+                    badges = []
+                    if c_info.get("had_percent"):
+                        badges.append("`%` 제거 → 기본 단위 `'%'` 힌트 기록")
+                    if c_info.get("had_comma"):
+                        badges.append("천단위 `,` 제거")
+                    badge_str = f" ({', '.join(badges)})" if badges else " (공백/문자열 정제)"
+                    cleaned_items_desc.append(
+                        f"`{c_name}`: `\"{c_info['sample_before']}\"` → `{c_info['sample_after']}` (`float64` 변환 완료){badge_str}"
+                    )
+                st.info(
+                    "✨ **비표준 수치 문자열 자동 정제 완료**: "
+                    + "  |  ".join(cleaned_items_desc)
+                )
+
+            if quality_report:
+                dup_pairs = quality_report.get("duplicate_pairs", [])
+                const_cols = quality_report.get("constant_cols", [])
+                warn_lines: List[str] = []
+                if dup_pairs:
+                    dup_strs = []
+                    for dp in dup_pairs:
+                        suffix_note = " *(동일 헤더 중복 `.1` 접미사)*" if dp.get("is_suffix_dup") else " *(100% 동일 값)*"
+                        dup_strs.append(f"`{dp['col_a']}` ↔ `{dp['col_b']}`{suffix_note}")
+                    warn_lines.append(
+                        f"- **값이 100% 동일한 중복 컬럼 쌍 ({len(dup_pairs)}쌍)**: {', '.join(dup_strs)}\n"
+                        f"  *(💡 Step 2 변수 매핑 시 중복된 두 컬럼을 동시에 넣지 않도록 원본 태그 1개만 선택하는 것을 권장합니다.)*"
+                    )
+                if const_cols:
+                    const_strs = [
+                        f"`{cc['col']}` (고정값: `{cc['constant_value']}`)"
+                        for cc in const_cols
+                    ]
+                    warn_lines.append(
+                        f"- **전 구간 단일 상수 컬럼 ({len(const_cols)}개)**: {', '.join(const_strs)}\n"
+                        f"  *(💡 전 구간 값이 변하지 않는 상수 컬럼은 Step 3에서 변화량($\\Delta$)이 항상 `0`이므로 `control`이나 `kpi` 변수보다는 필요시 `feed`/`state` 참고용으로만 활용하세요.)*"
+                    )
+                if warn_lines:
+                    st.warning("🔍 **데이터 품질 사전 진단 안내**\n\n" + "\n".join(warn_lines))
 
     # 3) 시계열 데이터 포인트 축소 (Resampling / Aggregate) UI
     st.markdown("---")
@@ -1477,6 +1780,10 @@ def render_step1() -> None:
     )
 
     if apply_clicked or options_changed or st.session_state.get("processed_df") is None:
+        if selected_time_col != st.session_state.get("time_col"):
+            st.session_state["data_quality_report"] = diagnose_dataframe_quality(
+                raw_df, time_col=selected_time_col
+            )
         st.session_state["time_col"] = selected_time_col
         st.session_state["resample_rule"] = selected_rule
         st.session_state["resample_agg"] = selected_agg
@@ -1695,6 +2002,7 @@ def render_step2() -> None:
                 target_cat = cat_map[target_cat_label]
                 existing_items = list(st.session_state["var_mapping"].get(target_cat, []))
                 existing_tags = {item.get("tag", "") for item in existing_items}
+                unit_hints: Dict[str, str] = st.session_state.get("inferred_unit_hints") or {}
 
                 added_count = 0
                 for col_name in cols_to_add:
@@ -1702,7 +2010,7 @@ def render_step2() -> None:
                         new_entry: Dict[str, Any] = {
                             "tag": col_name,
                             "name": col_name,
-                            "unit": "",
+                            "unit": unit_hints.get(col_name, ""),
                         }
                         if target_cat == "state":
                             new_entry["limit_desc"] = ""
@@ -2005,6 +2313,48 @@ def render_step2() -> None:
                     + ", ".join(f"`{t}`" for t in missing_tags)
                 )
 
+            # 데이터 품질 사전 진단 연동: 현재 매핑된 태그 중 중복 컬럼 쌍 동시 포함 또는 상수 컬럼 매핑 안내
+            quality_report: Optional[Dict[str, Any]] = st.session_state.get("data_quality_report")
+            if quality_report:
+                mapped_tag_set = {
+                    (item.get("tag") or "").strip()
+                    for cat in CATEGORY_KEYS
+                    for item in current_mapping[cat]
+                    if (item.get("tag") or "").strip()
+                }
+                active_dup_warnings: List[str] = []
+                for dp in quality_report.get("duplicate_pairs", []):
+                    if dp["col_a"] in mapped_tag_set and dp["col_b"] in mapped_tag_set:
+                        active_dup_warnings.append(f"`{dp['col_a']}` & `{dp['col_b']}`")
+
+                const_col_map = {
+                    cc["col"]: cc["constant_value"]
+                    for cc in quality_report.get("constant_cols", [])
+                }
+                active_const_warnings: List[str] = []
+                for cat in ("control", "kpi"):
+                    for item in current_mapping[cat]:
+                        t = (item.get("tag") or "").strip()
+                        if t in const_col_map:
+                            active_const_warnings.append(
+                                f"`{t}` ({cat}, 고정값: {const_col_map[t]})"
+                            )
+
+                if active_dup_warnings or active_const_warnings:
+                    q_msgs: List[str] = []
+                    if active_dup_warnings:
+                        q_msgs.append(
+                            "• **값이 100% 동일한 중복 컬럼 쌍이 동시에 매핑됨**: "
+                            + ", ".join(active_dup_warnings)
+                            + " *(프롬프트 중복 서술 방지를 위해 둘 중 하나만 남기는 것을 권장합니다)*"
+                        )
+                    if active_const_warnings:
+                        q_msgs.append(
+                            "• **전 구간 단일 상수 컬럼이 조작(`control`)/목표(`kpi`) 변수에 매핑됨**: "
+                            + ", ".join(active_const_warnings)
+                        )
+                    st.warning("🩺 **매핑 변수 품질 점검 안내**\n\n" + "\n".join(q_msgs))
+
 
 def render_step3() -> None:
     """
@@ -2114,6 +2464,11 @@ def render_step3() -> None:
         st.session_state["raw_df"] = sample_df
         st.session_state["loaded_file_id"] = "builtin_sample_ncc_csv"
         st.session_state["time_col"] = "Timestamp"
+        st.session_state["numeric_clean_report"] = {}
+        st.session_state["inferred_unit_hints"] = {}
+        st.session_state["data_quality_report"] = diagnose_dataframe_quality(
+            sample_df, time_col="Timestamp"
+        )
         st.session_state["resample_rule"] = "원본 유지(집계 안 함)"
         st.session_state["resample_agg"] = "평균값(mean)"
         proc_sample, msg = perform_resampling(

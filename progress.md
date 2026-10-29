@@ -84,7 +84,7 @@
 ## Phase 5: NAS 재귀·대소문자 무시 파일 로더 및 비표준 수치 문자열(`%`, 콤마) 자동 정제 구현 (Step 1 & Step 3 호환성 패치)
 
 - **권장 모델 / Effort 설정**: `Argon` / **Effort: Medium (중간)**
-- **진행 상태**: [ ] 미완료
+- **진행 상태**: [x] 완료
 - **세부 구현 항목**:
   1. `./nas_archive`(또는 `NAS_ARCHIVE_DIR`) 폴더 정리 구조를 고려한 **하위 폴더 재귀 탐색** 및 **확장자 대소문자 무시(`.csv`, `.CSV`, `.Csv` 등)** 파일 로더 구현:
      - `pathlib.Path.rglob` 또는 `os.walk`를 사용하여 하위 디렉터리 내부의 CSV 파일까지 재귀적으로 탐색하고, 드롭다운에는 `NAS_ARCHIVE_DIR` 기준 상대 경로(예: `biodiesel/dataset.CSV`)로 표시
