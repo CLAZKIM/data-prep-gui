@@ -62,6 +62,8 @@ def get_sample_ncc_mapping() -> Dict[str, List[Dict[str, Any]]]:
                 "unit": "%",
                 "direction": "maximize",
                 "threshold": 0.2,
+                "valid_min": 0.0,
+                "valid_max": 100.0,
             },
             {
                 "tag": "STEAM_UNIT",
@@ -69,6 +71,8 @@ def get_sample_ncc_mapping() -> Dict[str, List[Dict[str, Any]]]:
                 "unit": "GJ/t",
                 "direction": "minimize",
                 "threshold": 0.05,
+                "valid_min": None,
+                "valid_max": None,
             },
         ],
     }
@@ -117,6 +121,37 @@ def create_sample_ncc_dataframe() -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _parse_optional_float(val: Any) -> Optional[float]:
+    """
+    선택적 수치 입력값(KPI valid_min, valid_max 등)을 파싱합니다.
+    미입력이거나 결측(None/NaN/빈 문자열)이면 제한 없음(None)을 반환하고,
+    0.0을 포함한 유효한 수치이면 float 값을 반환합니다.
+    """
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        return None if (math.isnan(fval) or math.isinf(fval)) else fval
+    if isinstance(val, str):
+        cleaned = val.strip().replace("%", "").replace(",", "").strip()
+        if not cleaned or cleaned.lower() in (
+            "none",
+            "null",
+            "nan",
+            "-",
+            "제한없음",
+            "제한 없음",
+            "미설정",
+        ):
+            return None
+        try:
+            fval = float(cleaned)
+            return None if (math.isnan(fval) or math.isinf(fval)) else fval
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
 def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataFrame:
     """
     카테고리별 변수 매핑 리스트(dict)를 st.data_editor 입력용 DataFrame으로 변환합니다.
@@ -138,7 +173,16 @@ def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataF
 
     if category == "kpi":
         df = pd.DataFrame(
-            rows, columns=["tag", "name", "unit", "direction", "threshold"]
+            rows,
+            columns=[
+                "tag",
+                "name",
+                "unit",
+                "direction",
+                "threshold",
+                "valid_min",
+                "valid_max",
+            ],
         )
         for col in ["tag", "name", "unit"]:
             df[col] = df[col].fillna("").astype(str)
@@ -149,6 +193,8 @@ def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataF
             .apply(lambda x: x.strip() if x.strip() in ("maximize", "minimize") else "maximize")
         )
         df["threshold"] = pd.to_numeric(df["threshold"], errors="coerce").fillna(0.1).astype("float64")
+        df["valid_min"] = df["valid_min"].apply(_parse_optional_float).astype("float64")
+        df["valid_max"] = df["valid_max"].apply(_parse_optional_float).astype("float64")
         return df
 
     raise ValueError(f"알 수 없는 변수 카테고리입니다: {category}")
@@ -209,6 +255,9 @@ def df_to_category_items(df: Optional[pd.DataFrame], category: str) -> List[Dict
             except (ValueError, TypeError):
                 threshold = 0.1
 
+            valid_min = _parse_optional_float(row.get("valid_min"))
+            valid_max = _parse_optional_float(row.get("valid_max"))
+
             records.append(
                 {
                     "tag": tag,
@@ -216,6 +265,8 @@ def df_to_category_items(df: Optional[pd.DataFrame], category: str) -> List[Dict
                     "unit": unit,
                     "direction": direction,
                     "threshold": threshold,
+                    "valid_min": valid_min,
+                    "valid_max": valid_max,
                 }
             )
 
@@ -1128,6 +1179,8 @@ def build_mapping_from_csv_metadata(
                 entry["threshold"] = float(prev_item.get("threshold", 0.1))
             except (ValueError, TypeError):
                 entry["threshold"] = 0.1
+            entry["valid_min"] = _parse_optional_float(prev_item.get("valid_min"))
+            entry["valid_max"] = _parse_optional_float(prev_item.get("valid_max"))
 
         new_mapping[cat].append(entry)
         seen_in_cat[cat].add(tag)
@@ -1383,7 +1436,12 @@ def perform_resampling(
         "10분(10min)": "10min",
         "30분(30min)": "30min",
         "1시간(1h)": "1h",
+        "2시간(2h)": "2h",
         "4시간(4h)": "4h",
+        "6시간(6h)": "6h",
+        "8시간(8h)": "8h",
+        "12시간(12h)": "12h",
+        "1일(1d)": "1d",
     }
     agg_map = {
         "평균값(mean)": "mean",
@@ -1549,6 +1607,20 @@ def _normalize_loaded_items(raw_list: Any, category: str) -> List[Dict[str, Any]
             row["threshold"] = item.get(
                 "threshold", item.get("개선 추출 기준값", item.get("기준값", 0.1))
             )
+            row["valid_min"] = item.get(
+                "valid_min",
+                item.get(
+                    "유효 최소값",
+                    item.get("유효최소값", item.get("min_val", None)),
+                ),
+            )
+            row["valid_max"] = item.get(
+                "valid_max",
+                item.get(
+                    "유효 최대값",
+                    item.get("유효최대값", item.get("max_val", None)),
+                ),
+            )
         normalized_rows.append(row)
 
     df = category_items_to_df(normalized_rows, category)
@@ -1634,6 +1706,24 @@ def _display_var_label(item: Dict[str, Any]) -> str:
     return name or tag or "미지정 변수"
 
 
+def _format_valid_range_text(
+    valid_min: Optional[float],
+    valid_max: Optional[float],
+    unit: str = "",
+) -> str:
+    """KPI의 유효 물리 범위(valid_min ~ valid_max) 설정을 사람이 읽기 쉬운 문자열로 포맷팅합니다."""
+    v_min = _parse_optional_float(valid_min)
+    v_max = _parse_optional_float(valid_max)
+    unit_str = f" {unit.strip()}" if (unit and unit.strip()) else ""
+    if v_min is not None and v_max is not None:
+        return f"{_format_num(v_min, 4)} ~ {_format_num(v_max, 4)}{unit_str}"
+    if v_min is not None:
+        return f"≥ {_format_num(v_min, 4)}{unit_str}"
+    if v_max is not None:
+        return f"≤ {_format_num(v_max, 4)}{unit_str}"
+    return "제한 없음"
+
+
 def _describe_lookahead_interval(lookahead_rows: int, resample_rule: str) -> str:
     """현재 집계 주기와 lookahead_rows를 결합하여 시간 간격 설명 문자열을 반환합니다."""
     minutes_map = {
@@ -1641,13 +1731,22 @@ def _describe_lookahead_interval(lookahead_rows: int, resample_rule: str) -> str
         "10분(10min)": 10,
         "30분(30min)": 30,
         "1시간(1h)": 60,
+        "2시간(2h)": 120,
         "4시간(4h)": 240,
+        "6시간(6h)": 360,
+        "8시간(8h)": 480,
+        "12시간(12h)": 720,
+        "1일(1d)": 1440,
     }
     unit_min = minutes_map.get(resample_rule)
     if unit_min is None:
         return f"원본 데이터 기준 {lookahead_rows}행 뒤 시점"
 
     total_min = unit_min * lookahead_rows
+    if total_min >= 1440 and total_min % 1440 == 0:
+        days = total_min // 1440
+        hours = total_min // 60
+        return f"{lookahead_rows}행 뒤 (약 {days}일 / {hours}시간 후, 집계 주기: {resample_rule})"
     if total_min >= 60 and total_min % 60 == 0:
         hours = total_min // 60
         return f"{lookahead_rows}행 뒤 (약 {hours}시간 후, 집계 주기: {resample_rule})"
@@ -1666,8 +1765,9 @@ def extract_golden_cases(
     notes_cache: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    설정한 모든 KPI의 threshold 조건을 동시에 만족하는 최적 운전 구간(Before 행 -> After 행)을
-    자동 탐색하여 st.data_editor 편집용 DataFrame으로 반환합니다.
+    설정한 모든 KPI의 threshold 조건 및 물리적 유효 범위(valid_min ~ valid_max) 필터 조건을
+    동시에 만족하는 최적 운전 구간(Before 행 -> After 행)을 자동 탐색하여
+    st.data_editor 편집용 DataFrame과 상세 필터링 진단 메시지 리스트를 반환합니다.
     """
     diagnostics: List[str] = []
     if proc_df is None or proc_df.empty:
@@ -1711,45 +1811,113 @@ def extract_golden_cases(
     golden_rows: List[Dict[str, Any]] = []
     case_seq = 1
 
-    # 각 KPI별 최대 개선폭 추적 (조건 만족 구간이 0건일 때 엔지니어에게 힌트 제공용)
-    max_improvements: Dict[str, float] = {}
+    total_candidate_pairs = n_rows - lookahead_rows
+    nan_excluded_count = 0
+    valid_range_excluded_count = 0
+    valid_range_excluded_but_thresh_ok_count = 0
+    threshold_excluded_count = 0
 
-    for i in range(n_rows - lookahead_rows):
+    # 각 KPI별 필터링 및 최대 개선폭 추적 (유효 범위 필터링 현황 및 기준값 조정 힌트 제공용)
+    kpi_stats: Dict[str, Dict[str, Any]] = {}
+    for kpi in kpi_items:
+        k_tag = kpi["tag"].strip()
+        kpi_stats[k_tag] = {
+            "out_of_range_pairs": 0,
+            "out_before_cnt": 0,
+            "out_after_cnt": 0,
+            "out_but_thresh_ok_cnt": 0,
+            "below_thresh_in_valid_cnt": 0,
+            "max_improvement_valid": None,
+            "max_improvement_raw": None,
+        }
+
+    for i in range(total_candidate_pairs):
         j = i + lookahead_rows
-        all_kpi_passed = True
+
+        # 1) 결측치(NaN) 존재 여부 먼저 확인
+        has_nan = False
+        for kpi in kpi_items:
+            tag = kpi["tag"].strip()
+            if pd.isna(numeric_cache[tag].iloc[i]) or pd.isna(numeric_cache[tag].iloc[j]):
+                has_nan = True
+                break
+        if has_nan:
+            nan_excluded_count += 1
+            continue
+
+        # 2) KPI별 물리적 유효 범위(valid_min ~ valid_max) 및 개선 기준(threshold) 평가
+        pair_out_of_valid_range = False
+        pair_all_thresh_passed = True
         kpi_summary_parts: List[str] = []
 
         for kpi in kpi_items:
             tag = kpi["tag"].strip()
             direction = (kpi.get("direction") or "maximize").strip().lower()
             threshold = float(kpi.get("threshold", 0.0) or 0.0)
+            valid_min = _parse_optional_float(kpi.get("valid_min"))
+            valid_max = _parse_optional_float(kpi.get("valid_max"))
             unit = (kpi.get("unit") or "").strip()
             unit_str = f" {unit}" if unit else ""
             label = (kpi.get("name") or tag).strip()
 
-            v_before = numeric_cache[tag].iloc[i]
-            v_after = numeric_cache[tag].iloc[j]
-
-            if pd.isna(v_before) or pd.isna(v_after):
-                all_kpi_passed = False
-                break
+            v_before = float(numeric_cache[tag].iloc[i])
+            v_after = float(numeric_cache[tag].iloc[j])
 
             raw_delta = float(v_after - v_before)
             improvement = raw_delta if direction == "maximize" else -raw_delta
+            st_entry = kpi_stats[tag]
 
-            if tag not in max_improvements or improvement > max_improvements[tag]:
-                max_improvements[tag] = improvement
+            if (
+                st_entry["max_improvement_raw"] is None
+                or improvement > st_entry["max_improvement_raw"]
+            ):
+                st_entry["max_improvement_raw"] = improvement
 
-            # 부동소수점 오차 보정을 위해 1e-9 여유 적용
-            if improvement + 1e-9 < threshold:
-                all_kpi_passed = False
-                break
+            # Before 또는 After 시점의 물리적 유효 범위 이탈 검사 (부동소수점 오차 1e-9 허용)
+            before_out = (
+                (valid_min is not None and v_before < valid_min - 1e-9)
+                or (valid_max is not None and v_before > valid_max + 1e-9)
+            )
+            after_out = (
+                (valid_min is not None and v_after < valid_min - 1e-9)
+                or (valid_max is not None and v_after > valid_max + 1e-9)
+            )
+            is_kpi_out_of_range = before_out or after_out
+            is_kpi_thresh_ok = (improvement + 1e-9 >= threshold)
+
+            if is_kpi_out_of_range:
+                pair_out_of_valid_range = True
+                st_entry["out_of_range_pairs"] += 1
+                if before_out:
+                    st_entry["out_before_cnt"] += 1
+                if after_out:
+                    st_entry["out_after_cnt"] += 1
+                if is_kpi_thresh_ok:
+                    st_entry["out_but_thresh_ok_cnt"] += 1
+            else:
+                if (
+                    st_entry["max_improvement_valid"] is None
+                    or improvement > st_entry["max_improvement_valid"]
+                ):
+                    st_entry["max_improvement_valid"] = improvement
+                if not is_kpi_thresh_ok:
+                    st_entry["below_thresh_in_valid_cnt"] += 1
+
+            if not is_kpi_thresh_ok:
+                pair_all_thresh_passed = False
 
             kpi_summary_parts.append(
                 f"{label}: {_format_num(v_before)}→{_format_num(v_after)}{unit_str} ({_format_signed_delta(raw_delta)}{unit_str})"
             )
 
-        if not all_kpi_passed:
+        if pair_out_of_valid_range:
+            valid_range_excluded_count += 1
+            if pair_all_thresh_passed:
+                valid_range_excluded_but_thresh_ok_count += 1
+            continue
+
+        if not pair_all_thresh_passed:
+            threshold_excluded_count += 1
             continue
 
         # 제어 변수(control) 변화 요약 생성
@@ -1820,20 +1988,71 @@ def extract_golden_cases(
         )
         case_seq += 1
 
+    # 3) 필터링 현황 요약 및 KPI별 진단 메시지 구성 (추출 0건일 때와 유효 범위/기준값 제외 발생 시 모두 활용)
+    illusion_clause = (
+        f" — 이 중 개선 기준(`threshold`)은 충족했으나 물리적 유효 범위 이탈로 제외된 착시/과도 구간 **`{valid_range_excluded_but_thresh_ok_count:,}`건**"
+        if valid_range_excluded_but_thresh_ok_count > 0
+        else ""
+    )
+    nan_clause = (
+        f" | 결측치(NaN) 제외: `{nan_excluded_count:,}`건"
+        if nan_excluded_count > 0
+        else ""
+    )
+    diagnostics.append(
+        f"• **전체 필터링 현황 요약**: 총 비교 구간 `{total_candidate_pairs:,}`쌍 중 → "
+        f"**최종 추출 `{len(golden_rows):,}`건** | "
+        f"개선 기준(`threshold`) 미달 제외: `{threshold_excluded_count:,}`건 | "
+        f"KPI 유효 물리 범위(`valid_min`~`valid_max`) 이탈 제외: **`{valid_range_excluded_count:,}`건**{illusion_clause}{nan_clause}"
+    )
+
+    for kpi in kpi_items:
+        tag = kpi["tag"].strip()
+        label = _display_var_label(kpi)
+        direction = (kpi.get("direction") or "maximize").strip().lower()
+        thresh = kpi.get("threshold", 0.0)
+        v_min = _parse_optional_float(kpi.get("valid_min"))
+        v_max = _parse_optional_float(kpi.get("valid_max"))
+        unit = (kpi.get("unit") or "").strip()
+        unit_str = f" {unit}" if unit else ""
+        dir_kor = "상승폭" if direction == "maximize" else "절감폭"
+        range_str = _format_valid_range_text(v_min, v_max, unit)
+
+        st_entry = kpi_stats[tag]
+        best_valid = st_entry["max_improvement_valid"]
+        best_raw = st_entry["max_improvement_raw"]
+        out_pairs = st_entry["out_of_range_pairs"]
+        out_b = st_entry["out_before_cnt"]
+        out_a = st_entry["out_after_cnt"]
+        out_thresh_ok = st_entry["out_but_thresh_ok_cnt"]
+        below_cnt = st_entry["below_thresh_in_valid_cnt"]
+
+        if best_valid is not None:
+            max_desc = f"유효 범위 내 최대 {dir_kor} = `{_format_num(best_valid, 3)}{unit_str}`"
+            if (
+                best_raw is not None
+                and out_pairs > 0
+                and abs(best_raw - best_valid) > 1e-6
+            ):
+                max_desc += f" *(유효 범위 필터 전 원본 최대: `{_format_num(best_raw, 3)}{unit_str}`)*"
+        elif best_raw is not None:
+            max_desc = (
+                f"유효 범위 내 만족 구간 없음 *(유효 범위 필터 전 원본 최대 {dir_kor} = `{_format_num(best_raw, 3)}{unit_str}`)*"
+            )
+        else:
+            max_desc = "유효 수치 데이터 없음"
+
+        range_excl_detail = (
+            f"유효 범위 이탈 제외 `{out_pairs:,}`건 (Before 이탈 {out_b:,}건, After 이탈 {out_a:,}건, 기준충족 착시 제외 {out_thresh_ok:,}건)"
+            if (v_min is not None or v_max is not None)
+            else "유효 범위 제한 없음"
+        )
+        diagnostics.append(
+            f"• **{label}**: 기준값(`threshold`) = `{thresh}{unit_str}`, 유효 범위 = `{range_str}` | "
+            f"{range_excl_detail}, 기준값 미달 `{below_cnt:,}`건 | {max_desc}"
+        )
+
     if not golden_rows:
-        for kpi in kpi_items:
-            tag = kpi["tag"].strip()
-            label = _display_var_label(kpi)
-            direction = kpi.get("direction", "maximize")
-            thresh = kpi.get("threshold", 0.0)
-            unit = (kpi.get("unit") or "").strip()
-            unit_str = f" {unit}" if unit else ""
-            best_val = max_improvements.get(tag)
-            if best_val is not None:
-                dir_kor = "상승폭" if direction == "maximize" else "절감폭"
-                diagnostics.append(
-                    f"• {label}: 설정 기준값(threshold) = {thresh}{unit_str} | 현재 데이터 내 최대 {dir_kor} = {_format_num(best_val, 3)}{unit_str}"
-                )
         return pd.DataFrame(), diagnostics
 
     out_df = pd.DataFrame(golden_rows)
@@ -2028,9 +2247,16 @@ def generate_qa_from_golden_case(
         direction = (item.get("direction") or "maximize").strip().lower()
         dir_kor = "극대화(maximize)" if direction == "maximize" else "최소화(minimize)"
         thresh = _format_num(item.get("threshold", 0.0), 4)
+        v_min = _parse_optional_float(item.get("valid_min"))
+        v_max = _parse_optional_float(item.get("valid_max"))
+        valid_range_clause = (
+            f", 유효 물리 범위: {_format_valid_range_text(v_min, v_max, unit)}"
+            if (v_min is not None or v_max is not None)
+            else ""
+        )
         val_b = _format_num(before_s.get(tag))
         kpi_input_lines.append(
-            f"  - {label}: {val_b}{unit_str} [목표 방향: {dir_kor}, 최소 개선 기준: {thresh}{unit_str} 이상]"
+            f"  - {label}: {val_b}{unit_str} [목표 방향: {dir_kor}, 최소 개선 기준: {thresh}{unit_str} 이상{valid_range_clause}]"
         )
     if not kpi_input_lines:
         kpi_input_lines.append("  - (등록된 목표 성과 변수 없음)")
@@ -2621,9 +2847,9 @@ def render_step1() -> None:
                 - RTDB에서 1초~1분 간격으로 수집된 원시 데이터에는 유량계 출렁임, 밸브 헌팅(Hunting), 일시적 센서 노이즈가 다수 포함되어 있습니다.
                 - 일정 시간 구간(예: 10분, 30분, 1시간)의 **평균값(`mean`)**이나 **중앙값(`median`)**으로 집계하면 일시적 노이즈가 상쇄되고 실제 공정의 추세(Trend)만 깔끔하게 남습니다.
 
-                **2. 화학공정의 체류시간(Residence Time) 및 열적 평형 반영**
-                - 열분해로나 대형 정류탑에서 운전원이 온도(`COT`)나 환류비를 조작하더라도, 그 효과가 탑저 제품 수율(`KPI`)에 온전히 나타나기까지는 수십 분~수 시간의 **체류시간 및 응답 지연(Dead Time)**이 존재합니다.
-                - 공정 특성에 맞는 시간 단위로 데이터를 압축해야 **'운전 조작(Before) → 공정 안정화 및 성과 개선(After)'**의 인과관계를 왜곡 없이 추출할 수 있습니다.
+                **2. 화학공정의 체류시간(Residence Time)·열적 평형 및 반회분식(Cycle) 운전 반영**
+                - 열분해로나 대형 정류탑, 바이오디젤 반응·정제 공정 등에서 운전원이 온도(`COT`)나 환류비, 스팀 유량을 조작하더라도, 그 효과가 탑저 제품 수율(`KPI`)에 온전히 나타나기까지는 수십 분~수 시간 이상의 **체류시간 및 응답 지연(Dead Time)**이 존재합니다.
+                - 단주기(`1min`~`1h`)뿐만 아니라 장주기 체류시간 및 반회분식(Semi-batch/Cycle) 운전 공정을 위한 **`2시간(2h)` ~ `12시간(12h)` · `1일(1d)`** 집계 주기를 선택하면, 원료 급변이나 홀드업(Holdup) 배출로 인한 단기 과도 출렁임을 평활화하고 **'운전 조작(Before) → 공정 안정화 및 성과 개선(After)'**의 인과관계를 왜곡 없이 추출할 수 있습니다.
 
                 **3. 학습 데이터 중복 방지 및 연산 속도 향상**
                 - 수십만 행의 원시 데이터를 그대로 비교하면 거의 동일한 상태의 중복 샘플이 대량 생성됩니다. 적절한 주기로 축소하면 대표성 높은 핵심 골든 케이스만 빠르게 선별할 수 있습니다.
@@ -2658,7 +2884,12 @@ def render_step1() -> None:
         "10분(10min)",
         "30분(30min)",
         "1시간(1h)",
+        "2시간(2h)",
         "4시간(4h)",
+        "6시간(6h)",
+        "8시간(8h)",
+        "12시간(12h)",
+        "1일(1d)",
     ]
     current_rule = st.session_state.get("resample_rule", "원본 유지(집계 안 함)")
     rule_idx = rule_options.index(current_rule) if current_rule in rule_options else 0
@@ -3038,6 +3269,8 @@ def render_step2() -> None:
                         elif target_cat == "kpi":
                             new_entry["direction"] = "maximize"
                             new_entry["threshold"] = 0.1
+                            new_entry["valid_min"] = None
+                            new_entry["valid_max"] = None
                         existing_items.append(new_entry)
                         added_count += 1
 
@@ -3227,17 +3460,22 @@ def render_step2() -> None:
                         - 운전 최적화를 통해 최종적으로 달성하고자 하는 **핵심 성과 지표(수율 극대화, 에너지 원단위 최소화, 손실 최소화 등)**입니다.
                         - **목표 방향 (`direction`)**: 수치가 커질수록 좋으면 `maximize`, 작아질수록 좋으면 `minimize`를 선택하세요.
                         - **개선 추출 기준값 (`threshold`)**: Step 3에서 `Before → After` 구간을 비교할 때, 최소 이 기준값 이상 개선된 우수 운전 구간(Golden Case)만 자동으로 골라냅니다.
+                        - **유효 최소값 (`valid_min`) / 유효 최대값 (`valid_max`) *(선택 사항 — 미입력 시 제한 없음)***:
+                          - 원료 투입 급감 시 탑 내부 체류량(Holdup) 배출로 인해 순간 생산 수율이 **`100%`를 초과**하거나, 센서 이상/가동 정지 구간에서 비정상적인 수치가 기록되는 **물리적 착시 구간**이 `Before` 또는 `After` 시점에 포함되지 않도록 필터링합니다.
+                          - 예: 수율(`%`) 변수에 `valid_min = 0`, `valid_max = 100`을 입력하면 `100%`를 초과하는 착시 행이 골든 케이스에서 정확히 제외됩니다.
 
                         **📌 구체적 입력 예시**
-                        | 태그명 (`tag`) | 한글 명칭 (`name`) | 단위 (`unit`) | 목표 방향 (`direction`) | 개선 추출 기준값 (`threshold`) |
-                        | :--- | :--- | :--- | :--- | :--- |
-                        | `C2_YIELD` | 에틸렌 수율 | `%` | `maximize` | `0.2` *(+0.2%p 이상 상승 시 추출)* |
-                        | `C3_YIELD` | 프로필렌 수율 | `%` | `maximize` | `0.15` *(+0.15%p 이상 상승 시 추출)* |
-                        | `STEAM_UNIT` | 톤당 스팀 원단위 | `GJ/t` | `minimize` | `0.05` *(-0.05 GJ/t 이상 절감 시 추출)* |
-                        | `C2_LOSS` | 탑저 에틸렌 손실 | `ppm` | `minimize` | `10.0` *(-10 ppm 이상 감소 시 추출)* |
+                        | 태그명 (`tag`) | 한글 명칭 (`name`) | 단위 (`unit`) | 목표 방향 (`direction`) | 개선 기준 (`threshold`) | 유효 최소 (`valid_min`) | 유효 최대 (`valid_max`) |
+                        | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+                        | `C2_YIELD` | 에틸렌 수율 | `%` | `maximize` | `0.2` *(+0.2%p↑)* | `0.0` | `100.0` *(100% 초과 착시 제외)* |
+                        | `BD Yeild` | 바이오디젤 수율 | `%` | `maximize` | `0.5` *(+0.5%p↑)* | `0.0` | `100.0` *(홀드업 배출 착시 제외)* |
+                        | `STEAM_UNIT` | 톤당 스팀 원단위 | `GJ/t` | `minimize` | `0.05` *(-0.05↓)* | *(비워둠)* | *(비워둠)* |
+                        | `C2_LOSS` | 탑저 에틸렌 손실 | `ppm` | `minimize` | `10.0` *(-10 ppm↓)* | `0.0` | *(비워둠)* |
                         """
                     )
-            st.caption("에틸렌 수율, 스팀 원단위 등 극대화(maximize)/최소화(minimize)할 목표 지표를 입력하세요.")
+            st.caption(
+                "에틸렌/바이오디젤 수율, 스팀 원단위 등 목표 지표와 개선 기준(threshold), 선택적 물리 유효 범위(valid_min/valid_max)를 입력하세요."
+            )
             edited_kpi_df = st.data_editor(
                 base_dfs["kpi"],
                 key=f"editor_kpi_{editor_version}",
@@ -3247,7 +3485,7 @@ def render_step2() -> None:
                 column_config={
                     "tag": st.column_config.TextColumn(
                         "태그명 (tag)",
-                        help="CSV 컬럼명 또는 RTDB 태그명 (예: C2_YIELD)",
+                        help="CSV 컬럼명 또는 RTDB 태그명 (예: C2_YIELD, BD Yeild)",
                         required=True,
                     ),
                     "name": st.column_config.TextColumn(
@@ -3274,6 +3512,20 @@ def render_step2() -> None:
                         format="%.4g",
                         default=0.1,
                         required=True,
+                    ),
+                    "valid_min": st.column_config.NumberColumn(
+                        "유효 최소값 (valid_min)",
+                        help="선택 사항(미입력 시 제한 없음): Before 및 After 시점의 KPI가 이 값 이상인 구간만 추출합니다 (예: 수율 0.0).",
+                        step=0.5,
+                        format="%.4g",
+                        required=False,
+                    ),
+                    "valid_max": st.column_config.NumberColumn(
+                        "유효 최대값 (valid_max)",
+                        help="선택 사항(미입력 시 제한 없음): Before 및 After 시점의 KPI가 이 값 이하인 구간만 추출합니다 (예: 수율 100.0 설정 시 100% 초과 홀드업 착시 행 제외).",
+                        step=0.5,
+                        format="%.4g",
+                        required=False,
                     ),
                 },
             )
@@ -3424,18 +3676,25 @@ def render_step3() -> None:
     with st.container(border=True):
         top_h_col, top_help_col = st.columns([3, 1])
         with top_h_col:
-            st.markdown("##### ⏭️ 비교 시점 간격 (`lookahead_rows`) 설정 및 골든 케이스 자동 탐색")
+            st.markdown("##### ⏭️ 비교 시점 간격 (`lookahead_rows`) 설정 및 KPI 물리적 유효 범위(이상치 제외) 필터")
         with top_help_col:
             with st.popover("❓ 비교 시점 간격(Lookahead)이란?", use_container_width=True):
                 st.markdown(
                     """
-                    **⏱️ 비교 시점 간격 (`lookahead_rows`)의 화학공학적 의미**
-                    - 운전원이 제어 변수(`control`, 예: 분해로 출구온도 `COT`, 정류탑 환류비 등)를 조작한 시점(**Before 행, $t$**) 이후, 공정이 열적·물질적 평형에 도달하여 목표 성과(`kpi`, 예: 에틸렌 수율, 스팀 원단위)가 실제로 개선되기까지는 **공정 체류시간(Residence Time) 및 응답 지연(Dead Time)**이 소요됩니다.
+                    **⏱️ 1. 비교 시점 간격 (`lookahead_rows`)의 화학공학적 의미**
+                    - 운전원이 제어 변수(`control`, 예: 분해로 출구온도 `COT`, 정류탑 환류비, 스팀 유량 등)를 조작한 시점(**Before 행, $t$**) 이후, 공정이 열적·물질적 평형에 도달하여 목표 성과(`kpi`, 예: 에틸렌/바이오디젤 수율, 스팀 원단위)가 실제로 개선되기까지는 **공정 체류시간(Residence Time) 및 응답 지연(Dead Time)**이 소요됩니다.
                     - `lookahead_rows`는 **집계된 데이터(Step 1 결과) 기준으로 몇 행 뒤($t + \\text{lookahead\\_rows}$)의 결과를 After 시점으로 삼아 비교할지** 결정하는 값입니다.
 
                     **📌 설정 예시**
                     - Step 1 집계 주기가 **`10분(10min)`**이고 공정 응답 시간이 약 **30분**이라면 👉 `lookahead_rows = 3` (3행 뒤 = 30분 후 비교)
                     - Step 1 집계 주기가 **`1시간(1h)`**이고 **1시간 뒤** 안정화 상태를 비교한다면 👉 `lookahead_rows = 1` (1행 뒤 = 1시간 후 비교)
+                    - Step 1 집계 주기가 **`8시간(8h)` / `12시간(12h)`**인 장주기·반회분식 공정에서 다음 운전 사이클을 비교한다면 👉 `lookahead_rows = 1` (약 8시간 / 12시간 후 비교)
+
+                    ---
+
+                    **🛡️ 2. KPI 물리적 유효 범위 (`valid_min` ~ `valid_max`) 필터란?**
+                    - 원료 투입량을 급격히 줄이는 감량 운전 시 탑/반응기 내부 체류량(Holdup)이 일시 배출되면서 순간 계산 수율이 **`100%`를 초과(예: `105%`, `128%`)**하는 등 물리적으로 불가능한 **착시 구간(Artefact)**이 발생할 수 있습니다.
+                    - KPI별로 `유효 최소값(valid_min)` / `유효 최대값(valid_max)`을 설정하면 **Before 또는 After 시점 중 하나라도 유효 범위를 벗어난 이상치 구간을 골든 케이스에서 자동으로 제외**합니다 (비워두면 제한 없음).
                     """
                 )
 
@@ -3461,7 +3720,16 @@ def render_step3() -> None:
                     k_dir = "▲극대화" if k.get("direction") == "maximize" else "▼최소화"
                     k_thr = _format_num(k.get("threshold", 0.0), 4)
                     k_unit = (k.get("unit") or "").strip()
-                    kpi_cond_badges.append(f"`{k_label}` ({k_dir} ≥ {k_thr}{(' ' + k_unit) if k_unit else ''})")
+                    v_min_k = _parse_optional_float(k.get("valid_min"))
+                    v_max_k = _parse_optional_float(k.get("valid_max"))
+                    range_note = (
+                        f", 유효범위: {_format_valid_range_text(v_min_k, v_max_k, k_unit)}"
+                        if (v_min_k is not None or v_max_k is not None)
+                        else ""
+                    )
+                    kpi_cond_badges.append(
+                        f"`{k_label}` ({k_dir} ≥ {k_thr}{(' ' + k_unit) if k_unit else ''}{range_note})"
+                    )
                 kpi_cond_text = " **AND** ".join(kpi_cond_badges)
             else:
                 kpi_cond_text = "*(Step 2에서 설정된 KPI 없음)*"
@@ -3477,13 +3745,151 @@ def render_step3() -> None:
                 "🔍 개선 구간 재탐색",
                 type="primary",
                 use_container_width=True,
-                help="현재 설정된 lookahead_rows와 모든 KPI threshold 조건을 만족하는 최적 운전 구간을 다시 탐색합니다.",
+                help="현재 설정된 lookahead_rows와 모든 KPI threshold 및 물리적 유효 범위 조건을 만족하는 최적 운전 구간을 다시 탐색합니다.",
             )
             sample_load_clicked = st.button(
                 "🧪 샘플 데이터로 즉시 체험",
                 use_container_width=True,
                 help="외부 CSV 파일이 없어도 NCC 공정 샘플 시계열 데이터(16행)와 4대 변수 매핑을 한 번에 불러와 Step 3를 즉시 테스트합니다.",
             )
+
+        # Step 3 내 KPI 유효 물리 범위(valid_min / valid_max) 빠른 설정 패널 (Step 2 KPI 표와 양방향 자동 동기화)
+        if kpi_list:
+            with st.expander(
+                "🛡️ KPI별 물리적 유효 범위(valid_min / valid_max) 및 개선 기준(threshold) 빠른 필터 조정 (Step 2 연동)",
+                expanded=True,
+            ):
+                st.caption(
+                    "원료 급감 시 탑 내부 체류량(Holdup) 배출로 인해 순간 수율이 `100%`를 초과하는 착시 구간 등이 Before/After에 포함되지 않도록 "
+                    "KPI별 **유효 최소값(`valid_min`)**과 **유효 최대값(`valid_max`)**을 설정할 수 있습니다 (비워두면 제한 없음, 적용 시 Step 2 KPI 표와 프리셋 저장에도 자동 반영)."
+                )
+                vr_form_cols = st.columns([2.4, 1.1, 1.0])
+                with vr_form_cols[1]:
+                    auto_pct_range_clicked = st.button(
+                        "⚡ 수율(%) KPI 0~100 범위 자동 입력",
+                        use_container_width=True,
+                        help="단위가 '%'이거나 이름/태그에 '수율/yield/yeild'가 포함된 KPI에 valid_min=0.0, valid_max=100.0을 일괄 설정합니다.",
+                    )
+                with vr_form_cols[2]:
+                    clear_valid_range_clicked = st.button(
+                        "🔓 유효 범위 제한 모두 해제",
+                        use_container_width=True,
+                        help="모든 KPI의 valid_min, valid_max 제한을 해제(미설정)합니다.",
+                    )
+
+                if auto_pct_range_clicked:
+                    updated_kpis = []
+                    applied_labels = []
+                    for k_item in kpi_list:
+                        new_k = dict(k_item)
+                        u_str = (new_k.get("unit") or "").strip().lower()
+                        t_str = (new_k.get("tag") or "").strip().lower()
+                        n_str = (new_k.get("name") or "").strip().lower()
+                        if (
+                            "%" in u_str
+                            or "yield" in t_str
+                            or "yeild" in t_str
+                            or "수율" in n_str
+                        ):
+                            new_k["valid_min"] = 0.0
+                            new_k["valid_max"] = 100.0
+                            applied_labels.append(_display_var_label(new_k))
+                        updated_kpis.append(new_k)
+                    if not applied_labels and updated_kpis:
+                        updated_kpis[0]["valid_min"] = 0.0
+                        updated_kpis[0]["valid_max"] = 100.0
+                        applied_labels.append(_display_var_label(updated_kpis[0]))
+                    st.session_state["var_mapping"]["kpi"] = updated_kpis
+                    sync_editor_base_dfs_from_mapping()
+                    st.session_state["step3_flash_type"] = "success"
+                    st.session_state["step3_flash_msg"] = (
+                        f"🛡️ {', '.join(applied_labels)}에 물리적 유효 범위 `0.0 ~ 100.0` 필터가 적용되었습니다 (100% 초과 착시 구간 자동 제외)."
+                    )
+                    st.rerun()
+
+                if clear_valid_range_clicked:
+                    updated_kpis = []
+                    for k_item in kpi_list:
+                        new_k = dict(k_item)
+                        new_k["valid_min"] = None
+                        new_k["valid_max"] = None
+                        updated_kpis.append(new_k)
+                    st.session_state["var_mapping"]["kpi"] = updated_kpis
+                    sync_editor_base_dfs_from_mapping()
+                    st.session_state["step3_flash_type"] = "warning"
+                    st.session_state["step3_flash_msg"] = (
+                        "🔓 모든 KPI의 물리적 유효 범위(valid_min / valid_max) 제한이 해제되었습니다."
+                    )
+                    st.rerun()
+
+                kpi_range_changed = False
+                updated_kpi_list: List[Dict[str, Any]] = []
+                kpi_ver = st.session_state.get("mapping_editor_version", 0)
+
+                for k_idx, k_item in enumerate(kpi_list):
+                    k_tag = (k_item.get("tag") or "").strip()
+                    k_label = _display_var_label(k_item)
+                    k_unit = (k_item.get("unit") or "").strip()
+                    k_dir = (k_item.get("direction") or "maximize").strip()
+                    cur_thr = float(k_item.get("threshold", 0.1) or 0.0)
+                    cur_vmin = _parse_optional_float(k_item.get("valid_min"))
+                    cur_vmax = _parse_optional_float(k_item.get("valid_max"))
+
+                    kc1, kc2, kc3, kc4 = st.columns([1.6, 1.0, 1.1, 1.1])
+                    with kc1:
+                        dir_badge = "▲ 극대화(maximize)" if k_dir == "maximize" else "▼ 최소화(minimize)"
+                        unit_badge = f" [{k_unit}]" if k_unit else ""
+                        st.markdown(
+                            f"**{k_label}**{unit_badge}<br><span style='font-size:0.85em; color:gray;'>목표 방향: {dir_badge}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    with kc2:
+                        new_thr_val = st.number_input(
+                            f"개선 기준 (threshold){f' [{k_unit}]' if k_unit else ''}",
+                            min_value=0.0,
+                            value=cur_thr,
+                            step=0.05,
+                            format="%.4g",
+                            key=f"step3_kpi_thr_{k_idx}_{k_tag}_{kpi_ver}",
+                        )
+                    with kc3:
+                        vmin_str = st.text_input(
+                            f"유효 최소값 (valid_min){f' [{k_unit}]' if k_unit else ''}",
+                            value="" if cur_vmin is None else _format_num(cur_vmin, 4),
+                            placeholder="제한 없음 (예: 0)",
+                            key=f"step3_kpi_vmin_{k_idx}_{k_tag}_{kpi_ver}",
+                            help="비워두면 하한 제한을 두지 않습니다.",
+                        )
+                    with kc4:
+                        vmax_str = st.text_input(
+                            f"유효 최대값 (valid_max){f' [{k_unit}]' if k_unit else ''}",
+                            value="" if cur_vmax is None else _format_num(cur_vmax, 4),
+                            placeholder="제한 없음 (예: 100)",
+                            key=f"step3_kpi_vmax_{k_idx}_{k_tag}_{kpi_ver}",
+                            help="예: 수율 변수에 100 입력 시 100%를 초과하는 홀드업 착시 행이 Before/After에서 제외됩니다.",
+                        )
+
+                    parsed_vmin = _parse_optional_float(vmin_str)
+                    parsed_vmax = _parse_optional_float(vmax_str)
+                    new_thr_float = float(new_thr_val)
+
+                    if (
+                        abs(new_thr_float - cur_thr) > 1e-9
+                        or parsed_vmin != cur_vmin
+                        or parsed_vmax != cur_vmax
+                    ):
+                        kpi_range_changed = True
+
+                    new_k_entry = dict(k_item)
+                    new_k_entry["threshold"] = new_thr_float
+                    new_k_entry["valid_min"] = parsed_vmin
+                    new_k_entry["valid_max"] = parsed_vmax
+                    updated_kpi_list.append(new_k_entry)
+
+                if kpi_range_changed:
+                    st.session_state["var_mapping"]["kpi"] = updated_kpi_list
+                    sync_editor_base_dfs_from_mapping()
+                    st.rerun()
 
     # [샘플 데이터로 즉시 체험] 버튼 처리
     if sample_load_clicked:
@@ -3577,14 +3983,24 @@ def render_step3() -> None:
 
     if golden_base_df is None or golden_base_df.empty:
         st.warning(
-            f"⚠️ 설정한 비교 간격(`lookahead_rows = {int(lookahead_val)}`)과 모든 KPI의 `threshold` 조건을 동시에 만족하는 운전 구간(Before → After)이 없습니다."
+            f"⚠️ 설정한 비교 간격(`lookahead_rows = {int(lookahead_val)}`)과 모든 KPI의 개선 기준(`threshold`) 및 물리적 유효 범위(`valid_min`~`valid_max`) 조건을 동시에 만족하는 운전 구간(Before → After)이 없습니다."
         )
         if diag_msgs:
             with st.container(border=True):
-                st.markdown("**💡 데이터 내 KPI 최대 변화폭 진단 (Step 2 `threshold` 조정 참고용)**")
+                st.markdown(
+                    "**💡 필터링 제외 현황 및 데이터 내 KPI 최대 변화폭 진단 (`threshold` / `valid_min` / `valid_max` 조정 참고용)**"
+                )
                 for d_msg in diag_msgs:
                     st.markdown(d_msg)
         return
+
+    if diag_msgs:
+        with st.container(border=True):
+            st.markdown(
+                "**📊 KPI 개선 기준(`threshold`) 및 물리적 유효 범위(`valid_min`~`valid_max`) 필터링 진단 현황**"
+            )
+            for d_msg in diag_msgs:
+                st.markdown(d_msg)
 
     # --------------------------------------------------------------------------
     # 3) 추출된 골든 케이스 편집 표 (st.data_editor) 및 도메인 전문가 보충 멘트 입력
