@@ -135,7 +135,7 @@
 ## Phase 8: Step 2 ↔ Step 3 목표 성과 변수(`kpi`) 설정값 양방향 상태 동기화 버그 수정 (Step 2 & Step 3 상태 관리 정상화)
 
 - **권장 모델 / Effort 설정**: `Argon` / **Effort: Medium (중간)** _(Streamlit 위젯 세션 생명주기 및 양방향 동기화 정밀 수정)_
-- **진행 상태**: [ ] 미완료
+- **진행 상태**: [x] 완료
 - **세부 구현 항목**:
   1. Step 2의 ④ 목표 성과 변수(`kpi`) `st.data_editor`에서 `threshold`, `valid_min`, `valid_max`를 수정했을 때 Step 3 빠른 필터 위젯이 이전 위젯 상태를 반환하며 새 값을 덮어쓰던(Rollback) 역전 버그 해결:
      - `render_step3` 내 KPI 빠른 필터 패널의 폴링 비교 및 강제 `st.rerun()` 블록(`if kpi_range_changed: ...`)을 제거

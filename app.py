@@ -285,7 +285,7 @@ def build_mapping_base_dfs(
 
 def sync_editor_base_dfs_from_mapping() -> None:
     """
-    프로그래밍 방식(프리셋 불러오기, 예시 채우기, 컬럼 빠른 추가, 초기화 등)으로
+    프로그래밍 방식(프리셋 불러오기, 예시 채우기, 컬럼 빠른 추가, 초기화, Step 3 빠른 필터 변경 등)으로
     st.session_state['var_mapping']이 갱신되었을 때 st.data_editor 위젯에 즉시 반영되도록
     베이스 DataFrame을 재구축하고 위젯 버전 키를 증가시킵니다.
     """
@@ -295,6 +295,50 @@ def sync_editor_base_dfs_from_mapping() -> None:
     st.session_state["mapping_editor_version"] = (
         st.session_state.get("mapping_editor_version", 0) + 1
     )
+
+
+def _on_step3_kpi_filter_change(
+    k_idx: int,
+    thr_key: str,
+    vmin_key: str,
+    vmax_key: str,
+) -> None:
+    """
+    Step 3의 KPI 빠른 필터 입력 위젯(threshold, valid_min, valid_max)을 사용자가 직접 조작했을 때만
+    호출되는 이벤트 기반(on_change) 콜백입니다.
+    단일 진실 공급원인 st.session_state['var_mapping']['kpi']를 갱신하고,
+    sync_editor_base_dfs_from_mapping()을 호출하여 Step 2의 KPI 표(st.data_editor)에 즉시 반영합니다.
+    """
+    var_mapping = st.session_state.get("var_mapping")
+    if not isinstance(var_mapping, dict):
+        return
+    kpi_list = var_mapping.get("kpi")
+    if not isinstance(kpi_list, list) or not (0 <= k_idx < len(kpi_list)):
+        return
+
+    updated_kpis = [dict(item) for item in kpi_list]
+    target_kpi = updated_kpis[k_idx]
+
+    if thr_key in st.session_state:
+        raw_thr = st.session_state.get(thr_key)
+        try:
+            new_thr = (
+                float(raw_thr)
+                if (raw_thr is not None and not pd.isna(raw_thr))
+                else 0.1
+            )
+        except (ValueError, TypeError):
+            new_thr = float(target_kpi.get("threshold", 0.1) or 0.0)
+        target_kpi["threshold"] = max(0.0, new_thr)
+
+    if vmin_key in st.session_state:
+        target_kpi["valid_min"] = _parse_optional_float(st.session_state.get(vmin_key))
+
+    if vmax_key in st.session_state:
+        target_kpi["valid_max"] = _parse_optional_float(st.session_state.get(vmax_key))
+
+    st.session_state["var_mapping"]["kpi"] = updated_kpis
+    sync_editor_base_dfs_from_mapping()
 
 
 def init_session_state() -> None:
@@ -3822,18 +3866,28 @@ def render_step3() -> None:
                     )
                     st.rerun()
 
-                kpi_range_changed = False
-                updated_kpi_list: List[Dict[str, Any]] = []
-                kpi_ver = st.session_state.get("mapping_editor_version", 0)
-
                 for k_idx, k_item in enumerate(kpi_list):
                     k_tag = (k_item.get("tag") or "").strip()
                     k_label = _display_var_label(k_item)
                     k_unit = (k_item.get("unit") or "").strip()
                     k_dir = (k_item.get("direction") or "maximize").strip()
-                    cur_thr = float(k_item.get("threshold", 0.1) or 0.0)
+                    cur_thr = max(0.0, float(k_item.get("threshold", 0.1) or 0.0))
                     cur_vmin = _parse_optional_float(k_item.get("valid_min"))
                     cur_vmax = _parse_optional_float(k_item.get("valid_max"))
+
+                    thr_key = f"step3_kpi_thr_{k_idx}_{k_tag}"
+                    vmin_key = f"step3_kpi_vmin_{k_idx}_{k_tag}"
+                    vmax_key = f"step3_kpi_vmax_{k_idx}_{k_tag}"
+
+                    # Step 2 KPI 표(st.data_editor) 편집·프리셋 로드 등으로 갱신된 최신 var_mapping["kpi"] 값을
+                    # Step 3 빠른 필터 위젯 렌더링 직전에 세션 상태에 선행 주입하여 역전(Rollback) 현상 원천 차단
+                    st.session_state[thr_key] = cur_thr
+                    st.session_state[vmin_key] = (
+                        "" if cur_vmin is None else _format_num(cur_vmin, 4)
+                    )
+                    st.session_state[vmax_key] = (
+                        "" if cur_vmax is None else _format_num(cur_vmax, 4)
+                    )
 
                     kc1, kc2, kc3, kc4 = st.columns([1.6, 1.0, 1.1, 1.1])
                     with kc1:
@@ -3844,52 +3898,33 @@ def render_step3() -> None:
                             unsafe_allow_html=True,
                         )
                     with kc2:
-                        new_thr_val = st.number_input(
+                        st.number_input(
                             f"개선 기준 (threshold){f' [{k_unit}]' if k_unit else ''}",
                             min_value=0.0,
-                            value=cur_thr,
                             step=0.05,
                             format="%.4g",
-                            key=f"step3_kpi_thr_{k_idx}_{k_tag}_{kpi_ver}",
+                            key=thr_key,
+                            on_change=_on_step3_kpi_filter_change,
+                            args=(k_idx, thr_key, vmin_key, vmax_key),
                         )
                     with kc3:
-                        vmin_str = st.text_input(
+                        st.text_input(
                             f"유효 최소값 (valid_min){f' [{k_unit}]' if k_unit else ''}",
-                            value="" if cur_vmin is None else _format_num(cur_vmin, 4),
                             placeholder="제한 없음 (예: 0)",
-                            key=f"step3_kpi_vmin_{k_idx}_{k_tag}_{kpi_ver}",
+                            key=vmin_key,
                             help="비워두면 하한 제한을 두지 않습니다.",
+                            on_change=_on_step3_kpi_filter_change,
+                            args=(k_idx, thr_key, vmin_key, vmax_key),
                         )
                     with kc4:
-                        vmax_str = st.text_input(
+                        st.text_input(
                             f"유효 최대값 (valid_max){f' [{k_unit}]' if k_unit else ''}",
-                            value="" if cur_vmax is None else _format_num(cur_vmax, 4),
                             placeholder="제한 없음 (예: 100)",
-                            key=f"step3_kpi_vmax_{k_idx}_{k_tag}_{kpi_ver}",
+                            key=vmax_key,
                             help="예: 수율 변수에 100 입력 시 100%를 초과하는 홀드업 착시 행이 Before/After에서 제외됩니다.",
+                            on_change=_on_step3_kpi_filter_change,
+                            args=(k_idx, thr_key, vmin_key, vmax_key),
                         )
-
-                    parsed_vmin = _parse_optional_float(vmin_str)
-                    parsed_vmax = _parse_optional_float(vmax_str)
-                    new_thr_float = float(new_thr_val)
-
-                    if (
-                        abs(new_thr_float - cur_thr) > 1e-9
-                        or parsed_vmin != cur_vmin
-                        or parsed_vmax != cur_vmax
-                    ):
-                        kpi_range_changed = True
-
-                    new_k_entry = dict(k_item)
-                    new_k_entry["threshold"] = new_thr_float
-                    new_k_entry["valid_min"] = parsed_vmin
-                    new_k_entry["valid_max"] = parsed_vmax
-                    updated_kpi_list.append(new_k_entry)
-
-                if kpi_range_changed:
-                    st.session_state["var_mapping"]["kpi"] = updated_kpi_list
-                    sync_editor_base_dfs_from_mapping()
-                    st.rerun()
 
     # [샘플 데이터로 즉시 체험] 버튼 처리
     if sample_load_clicked:
