@@ -23,6 +23,21 @@ NAS_ARCHIVE_DIR = os.environ.get("NAS_ARCHIVE_DIR", DEFAULT_NAS_DIR)
 
 CATEGORY_KEYS = ["feed", "control", "state", "kpi"]
 
+CONTROL_OUTPUT_MODE_SUMMARY = (
+    "① 핵심 조작 변수 + 현행 설정 유지 변수 요약 분리 (기본 권장)"
+)
+CONTROL_OUTPUT_MODE_ACTIVE_ONLY = (
+    "② 유의미한 조작 변수만 출력 (유지 변수 생략)"
+)
+CONTROL_OUTPUT_MODE_ALL_DETAIL = (
+    "③ 전체 제어 변수 개별 출력 (불감대 이내는 '현재 설정값 유지'로 표기)"
+)
+CONTROL_OUTPUT_MODE_OPTIONS = [
+    CONTROL_OUTPUT_MODE_SUMMARY,
+    CONTROL_OUTPUT_MODE_ACTIVE_ONLY,
+    CONTROL_OUTPUT_MODE_ALL_DETAIL,
+]
+
 
 def ensure_directories() -> None:
     """로컬 및 Docker 컨테이너 환경 호환을 위해 필수 상대 경로 폴더를 자동 생성합니다."""
@@ -38,8 +53,18 @@ def get_sample_ncc_mapping() -> Dict[str, List[Dict[str, Any]]]:
             {"tag": "TI-102", "name": "원료 예열 온도", "unit": "°C"},
         ],
         "control": [
-            {"tag": "COT", "name": "열분해로 출구온도", "unit": "°C"},
-            {"tag": "DSR", "name": "희석스팀비", "unit": "kg/kg"},
+            {
+                "tag": "COT",
+                "name": "열분해로 출구온도",
+                "unit": "°C",
+                "min_delta": 0.5,
+            },
+            {
+                "tag": "DSR",
+                "name": "희석스팀비",
+                "unit": "kg/kg",
+                "min_delta": 0.01,
+            },
         ],
         "state": [
             {
@@ -152,6 +177,18 @@ def _parse_optional_float(val: Any) -> Optional[float]:
     return None
 
 
+def _parse_optional_nonneg_float(val: Any) -> Optional[float]:
+    """
+    선택적 비음수 수치 입력값(제어 변수 최소 조작폭 min_delta 등)을 파싱합니다.
+    미입력이거나 결측(None/NaN/빈 문자열)이면 None을 반환하고,
+    유효한 수치이면 0.0 이상의 float 값으로 반환합니다.
+    """
+    parsed = _parse_optional_float(val)
+    if parsed is None:
+        return None
+    return max(0.0, float(parsed))
+
+
 def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataFrame:
     """
     카테고리별 변수 매핑 리스트(dict)를 st.data_editor 입력용 DataFrame으로 변환합니다.
@@ -159,10 +196,19 @@ def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataF
     """
     rows = items if isinstance(items, list) else []
 
-    if category in ("feed", "control"):
+    if category == "feed":
         df = pd.DataFrame(rows, columns=["tag", "name", "unit"])
         for col in ["tag", "name", "unit"]:
             df[col] = df[col].fillna("").astype(str)
+        return df
+
+    if category == "control":
+        df = pd.DataFrame(rows, columns=["tag", "name", "unit", "min_delta"])
+        for col in ["tag", "name", "unit"]:
+            df[col] = df[col].fillna("").astype(str)
+        df["min_delta"] = (
+            df["min_delta"].apply(_parse_optional_nonneg_float).astype("float64")
+        )
         return df
 
     if category == "state":
@@ -224,12 +270,22 @@ def df_to_category_items(df: Optional[pd.DataFrame], category: str) -> List[Dict
 
         # 태그명만 입력하고 한글 명칭을 비워둔 경우 태그명을 기본 명칭으로 보완하지 않고 그대로 유지하되,
         # 둘 중 하나라도 있으면 유효 행으로 인정
-        if category in ("feed", "control"):
+        if category == "feed":
             records.append(
                 {
                     "tag": tag,
                     "name": name,
                     "unit": unit,
+                }
+            )
+        elif category == "control":
+            min_delta = _parse_optional_nonneg_float(row.get("min_delta"))
+            records.append(
+                {
+                    "tag": tag,
+                    "name": name,
+                    "unit": unit,
+                    "min_delta": min_delta,
                 }
             )
         elif category == "state":
@@ -382,6 +438,9 @@ def init_session_state() -> None:
         "preview_case_select": None,
         "step3_flash_msg": None,
         "step3_flash_type": "success",
+        # Phase 9: 제어 변수(control) 불감대(Deadband) 및 프롬프트(output) 노이즈 분리 상태
+        "use_smart_deadband": True,
+        "control_output_mode": CONTROL_OUTPUT_MODE_SUMMARY,
         # Phase 4: JSONL 학습/검증 분할 생성 및 dataset_info.json 자동 등록 상태
         "dataset_name": "ncc_opt_v1",
         "val_split_pct": 10,
@@ -1214,7 +1273,11 @@ def build_mapping_from_csv_metadata(
             "name": resolved_name,
             "unit": resolved_unit,
         }
-        if cat == "state":
+        if cat == "control":
+            entry["min_delta"] = _parse_optional_nonneg_float(
+                prev_item.get("min_delta")
+            )
+        elif cat == "state":
             entry["limit_desc"] = str(prev_item.get("limit_desc", "") or "").strip()
         elif cat == "kpi":
             prev_dir = str(prev_item.get("direction", "maximize") or "maximize").strip().lower()
@@ -1640,7 +1703,15 @@ def _normalize_loaded_items(raw_list: Any, category: str) -> List[Dict[str, Any]
             "name": item.get("name", item.get("한글 명칭", item.get("한글명칭", ""))),
             "unit": item.get("unit", item.get("단위", "")),
         }
-        if category == "state":
+        if category == "control":
+            row["min_delta"] = item.get(
+                "min_delta",
+                item.get(
+                    "최소 조작폭",
+                    item.get("최소조작폭", item.get("deadband", None)),
+                ),
+            )
+        elif category == "state":
             row["limit_desc"] = item.get(
                 "limit_desc", item.get("관리 기준 설명", item.get("관리기준", ""))
             )
@@ -1801,12 +1872,451 @@ def _describe_lookahead_interval(lookahead_rows: int, resample_rule: str) -> str
     return f"{lookahead_rows}행 뒤 (약 {total_min}분 후, 집계 주기: {resample_rule})"
 
 
+# ------------------------------------------------------------------------------
+# Phase 9 핵심 로직: 제어 변수(control) 공학 단위·스케일 기반 불감대(Deadband) 및 노이즈 분리
+# ------------------------------------------------------------------------------
+def _classify_control_unit_kind(
+    unit: str,
+    tag: str = "",
+    name: str = "",
+) -> str:
+    """
+    제어 변수(control)의 공학 단위(및 단위 미입력 시 태그/한글명 보조 힌트)를 분석하여
+    물리량 유형('flow', 'ratio', 'temp_c', 'temp_f', 'press_bar', 'press_mpa',
+    'press_kpa', 'press_psi', 'press_mmhg', 'percent', 'ph', 'ppm', 'rpm', 'generic')을 반환합니다.
+    """
+    u = (unit or "").strip().lower().replace(" ", "")
+    hint_text = f"{tag or ''} {name or ''}".strip().lower()
+
+    if u:
+        # 1) 유량 단위 (분모가 시간 단위이거나 전용 유량 약어인 경우)
+        if "/" in u:
+            num_part, den_part = u.split("/", 1)
+            if den_part in (
+                "h",
+                "hr",
+                "hrs",
+                "hour",
+                "hours",
+                "m",
+                "min",
+                "mins",
+                "minute",
+                "minutes",
+                "s",
+                "sec",
+                "secs",
+                "second",
+                "d",
+                "day",
+                "days",
+            ):
+                return "flow"
+            if num_part and num_part == den_part:
+                return "ratio"
+
+        if u in (
+            "gpm",
+            "lpm",
+            "cfm",
+            "scfm",
+            "acfm",
+            "bpd",
+            "scmh",
+            "nm3h",
+            "m3h",
+            "kgh",
+            "kghr",
+            "lhr",
+            "lh",
+            "th",
+            "thr",
+        ):
+            return "flow"
+
+        # 2) 무차원 비율 단위
+        if u in (
+            "kg/kg",
+            "g/g",
+            "t/t",
+            "mol/mol",
+            "kmol/kmol",
+            "l/l",
+            "m3/m3",
+            "nm3/nm3",
+            "wt/wt",
+            "vol/vol",
+            "ratio",
+            "-",
+        ):
+            return "ratio"
+
+        # 3) 온도 단위
+        if u in ("°c", "℃", "degc", "c", "k", "kelvin", "°k"):
+            return "temp_c"
+        if u in ("°f", "℉", "degf", "f"):
+            return "temp_f"
+
+        # 4) 압력 단위 (스케일별 세분화)
+        if u in (
+            "bar",
+            "barg",
+            "bara",
+            "atm",
+            "ata",
+            "atg",
+            "kg/cm2",
+            "kg/cm²",
+            "kg/cm2g",
+            "kg/cm²g",
+            "kg/cm2a",
+            "kg/cm²a",
+            "kgf/cm2",
+            "kgf/cm²",
+            "kgf/cm2g",
+        ):
+            return "press_bar"
+        if u in ("mpa", "mpag", "mpaa"):
+            return "press_mpa"
+        if u in ("kpa", "kpag", "kpaa"):
+            return "press_kpa"
+        if u in ("psi", "psig", "psia"):
+            return "press_psi"
+        if u in (
+            "mmhg",
+            "torr",
+            "mmhga",
+            "mmhgg",
+            "mbar",
+            "mmh2o",
+            "mmaq",
+            "inh2o",
+            "pa",
+            "hpa",
+        ):
+            return "press_mmhg"
+
+        # 5) 백분율 / 밸브 개도율 / 농도 / pH / 회전수
+        if u in ("%", "wt%", "vol%", "mol%", "%open", "open%"):
+            return "percent"
+        if u == "ph":
+            return "ph"
+        if u in ("ppm", "ppmv", "ppmw", "mg/l", "mg/kg", "ppb", "ppbv", "ppbw"):
+            return "ppm"
+        if u in ("rpm", "hz"):
+            return "rpm"
+
+    # 단위가 비어 있거나 비표준인 경우 태그/한글명 보조 추론
+    if any(
+        kw in hint_text
+        for kw in ("dsr", "ratio", "환류비", "스팀비", "몰비", "혼합비", "비율")
+    ):
+        return "ratio"
+    if any(kw in hint_text for kw in ("flow", "유량", "투입량", "공급량")):
+        return "flow"
+    if (
+        any(kw in hint_text for kw in ("온도", "temp", "cot"))
+        or re.search(r"\b(inlet|outlet|ovhd|btm|feed|bed)\s*t\b", hint_text)
+    ):
+        return "temp_c"
+
+    return "generic"
+
+
+def _round_nice_deadband(val: float) -> float:
+    """
+    공학 엔지니어가 Step 2 표와 YAML 프리셋에서 직관적으로 읽고 수정할 수 있도록
+    권장 최소 조작폭(min_delta)을 깔끔한 유효숫자 격자(예: 0.05, 0.5, 1.5, 2.5, 3.0, 10.0, 65.0)로 반올림합니다.
+    """
+    if val <= 0 or math.isnan(val) or math.isinf(val):
+        return 0.0
+    exp = math.floor(math.log10(val))
+    base = 10.0 ** exp
+    mantissa = val / base
+    nice_grid = [
+        1.0,
+        1.2,
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+        3.5,
+        4.0,
+        4.5,
+        5.0,
+        5.5,
+        6.0,
+        6.5,
+        7.0,
+        7.5,
+        8.0,
+        8.5,
+        9.0,
+        9.5,
+        10.0,
+    ]
+    nearest_m = min(nice_grid, key=lambda g: abs(g - mantissa))
+    return round(nearest_m * base, max(0, 4 - exp))
+
+
+def _compute_smart_default_deadband(
+    unit: str,
+    ref_scale: Optional[float],
+    tag: str = "",
+    name: str = "",
+) -> float:
+    """
+    단위 유형과 기준 운전 스케일(Before 시점 값 또는 데이터 중앙값 절대치)을 결합하여
+    PID 계측 헌팅 노이즈를 걸러낼 스마트 기본 불감대(Effective Deadband)를 계산합니다.
+    - 온도(°C): 0.5 °C (화씨 °F: 1.0 °F)
+    - 압력(bar/barG): 최소 0.05 barG (고압 공정은 스케일의 1.0% 비례)
+    - 진공/저압(mmHg/mbar 등): 스케일 비례 (고진공 <2 mmHg는 0.05 mmHg, 일반 진공은 max(0.5, 스케일의 1.0%))
+    - 유량(kg/hr, l/hr, t/h 등): 기준 유량(Before) 대비 1.0% (최소 바닥값 0.01)
+    - 무차원 비(kg/kg 등): max(0.005, 스케일의 1.0%)
+    """
+    kind = _classify_control_unit_kind(unit, tag=tag, name=name)
+    scale = (
+        abs(float(ref_scale))
+        if (ref_scale is not None and not pd.isna(ref_scale) and not math.isnan(float(ref_scale)))
+        else 0.0
+    )
+
+    if kind == "temp_c":
+        return 0.5
+    if kind == "temp_f":
+        return 1.0
+    if kind == "press_bar":
+        return max(0.05, 0.01 * scale) if scale > 0 else 0.05
+    if kind == "press_mpa":
+        return max(0.005, 0.01 * scale) if scale > 0 else 0.005
+    if kind in ("press_kpa", "press_psi"):
+        return max(0.5, 0.01 * scale) if scale > 0 else 0.5
+    if kind == "press_mmhg":
+        if scale <= 1e-9:
+            return 0.5
+        if scale < 2.0:
+            return max(0.05, 0.05 * scale)
+        return max(0.5, 0.01 * scale)
+    if kind == "flow":
+        return max(0.01, 0.01 * scale) if scale > 1e-9 else 1.0
+    if kind == "ratio":
+        return max(0.005, 0.01 * scale) if scale > 1e-9 else 0.01
+    if kind == "percent":
+        return 0.5
+    if kind == "ph":
+        return 0.1
+    if kind == "ppm":
+        return max(1.0, 0.01 * scale) if scale > 1e-9 else 1.0
+    if kind == "rpm":
+        return max(0.5, 0.01 * scale) if scale > 1e-9 else 1.0
+
+    # generic (단위 미지정 기타 제어 변수)
+    return max(0.01, 0.01 * scale) if scale > 1e-9 else 0.05
+
+
+def compute_series_reference_scales(
+    df: Optional[pd.DataFrame],
+    control_items: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    """
+    로드된 데이터프레임에서 각 제어 변수(control)의 대표 운전 스케일(비영(non-zero) 절대값의 중앙값)을 추출합니다.
+    """
+    scales: Dict[str, float] = {}
+    if df is None or df.empty:
+        return scales
+
+    for item in control_items:
+        tag = (item.get("tag") or "").strip()
+        if not tag or tag in scales or tag not in df.columns:
+            continue
+        s = _coerce_numeric_series(df[tag]).dropna().abs()
+        if s.empty:
+            continue
+        non_zero = s[s > 1e-9]
+        ref_val = float(non_zero.median()) if not non_zero.empty else float(s.median())
+        if not math.isnan(ref_val) and not math.isinf(ref_val):
+            scales[tag] = ref_val
+    return scales
+
+
+def recommend_control_min_delta(
+    item: Dict[str, Any],
+    df: Optional[pd.DataFrame] = None,
+    series_ref_scales: Optional[Dict[str, float]] = None,
+) -> float:
+    """
+    Step 2의 [⚡ 단위/데이터 기반 권장 최소 조작폭 자동 입력] 도우미용 함수로,
+    제어 변수의 공학 단위와 현재 CSV 데이터 운전 스케일을 분석해 깔끔하게 반올림된 권장 min_delta를 반환합니다.
+    """
+    tag = (item.get("tag") or "").strip()
+    name = (item.get("name") or "").strip()
+    unit = (item.get("unit") or "").strip()
+
+    ref_scale: Optional[float] = None
+    if series_ref_scales is not None and tag in series_ref_scales:
+        ref_scale = series_ref_scales[tag]
+    elif df is not None and not df.empty and tag in df.columns:
+        s = _coerce_numeric_series(df[tag]).dropna().abs()
+        if not s.empty:
+            non_zero = s[s > 1e-9]
+            ref_scale = (
+                float(non_zero.median()) if not non_zero.empty else float(s.median())
+            )
+
+    raw_deadband = _compute_smart_default_deadband(
+        unit=unit,
+        ref_scale=ref_scale,
+        tag=tag,
+        name=name,
+    )
+    return _round_nice_deadband(raw_deadband)
+
+
+def resolve_effective_control_deadband(
+    item: Dict[str, Any],
+    v_before: Optional[float] = None,
+    use_smart_deadband: bool = True,
+    series_ref_scale: Optional[float] = None,
+) -> Tuple[float, str]:
+    """
+    개별 제어 변수의 유효 불감대(Effective Deadband)를 판정하여 (유효 최소 조작폭, 적용 출처)를 반환합니다.
+    1순위: Step 2에서 개별 지정된 min_delta (0.0 포함 명시적 입력값 우선 적용 -> 'explicit')
+    2순위: min_delta 미지정(None)이고 use_smart_deadband=True인 경우 단위·스케일 기반 스마트 기본 불감대 -> 'smart_default'
+    3순위: min_delta 미지정(None)이고 use_smart_deadband=False인 경우 불감대 미적용(0.0) -> 'none'
+    """
+    explicit_md = _parse_optional_nonneg_float(item.get("min_delta"))
+    if explicit_md is not None:
+        return float(explicit_md), "explicit"
+
+    if not use_smart_deadband:
+        return 0.0, "none"
+
+    tag = (item.get("tag") or "").strip()
+    name = (item.get("name") or "").strip()
+    unit = (item.get("unit") or "").strip()
+
+    ref_scale: Optional[float] = None
+    if (
+        v_before is not None
+        and not pd.isna(v_before)
+        and not math.isnan(float(v_before))
+        and abs(float(v_before)) > 1e-9
+    ):
+        ref_scale = abs(float(v_before))
+    elif series_ref_scale is not None and series_ref_scale > 1e-9:
+        ref_scale = float(series_ref_scale)
+
+    smart_md = _compute_smart_default_deadband(
+        unit=unit,
+        ref_scale=ref_scale,
+        tag=tag,
+        name=name,
+    )
+    return float(smart_md), "smart_default"
+
+
+def _format_approx_held_value(v_before: float, v_after: float, unit: str) -> str:
+    """불감대 이내 현행 유지 변수의 평균 운전 수준을 '약 65.0 °C' 형태로 깔끔하게 포맷팅합니다."""
+    mean_val = (float(v_before) + float(v_after)) / 2.0
+    unit_clean = (unit or "").strip()
+    unit_str = f" {unit_clean}" if unit_clean else ""
+    if abs(mean_val) >= 10.0 or abs(mean_val) < 1e-9:
+        num_str = f"{mean_val:.1f}"
+    elif abs(mean_val) >= 1.0:
+        num_str = f"{mean_val:.2f}".rstrip("0")
+        if num_str.endswith("."):
+            num_str += "0"
+    else:
+        num_str = _format_num(mean_val, 2)
+    return f"약 {num_str}{unit_str}"
+
+
+def evaluate_control_changes(
+    before_s: pd.Series,
+    after_s: pd.Series,
+    control_items: List[Dict[str, Any]],
+    use_smart_deadband: bool = True,
+    series_ref_scales: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    단일 골든 케이스(Before -> After)에 대해 모든 제어 변수(control)의 변화량과 유효 불감대를 비교하여,
+    실제 유의미하게 조작된 핵심 변수(is_significant=True)와 계측 노이즈 범위 내 유지 변수(is_significant=False)를 판정합니다.
+    불감대 이내(|Δ| < eff_min_delta) 변수는 절대 '상향 조작' / '하향 조작'으로 분류되지 않습니다.
+    """
+    results: List[Dict[str, Any]] = []
+    series_ref_scales = series_ref_scales or {}
+
+    for item in control_items:
+        tag = (item.get("tag") or "").strip()
+        label = _display_var_label(item)
+        short_name = (item.get("name") or tag or "미지정 변수").strip()
+        unit = (item.get("unit") or "").strip()
+        unit_str = f" {unit}" if unit else ""
+
+        v_b = _coerce_numeric_scalar(before_s.get(tag))
+        v_a = _coerce_numeric_scalar(after_s.get(tag))
+        has_valid_nums = bool(pd.notna(v_b) and pd.notna(v_a))
+
+        if has_valid_nums:
+            delta = float(v_a - v_b)
+            abs_delta = abs(delta)
+            eff_md, md_source = resolve_effective_control_deadband(
+                item=item,
+                v_before=float(v_b),
+                use_smart_deadband=use_smart_deadband,
+                series_ref_scale=series_ref_scales.get(tag),
+            )
+            if eff_md <= 1e-9:
+                is_sig = abs_delta > 1e-9
+            else:
+                is_sig = (abs_delta + 1e-9) >= eff_md
+
+            if is_sig:
+                action_verb = "상향 조작" if delta > 0 else "하향 조작"
+            else:
+                action_verb = "현재 설정값 유지"
+        else:
+            delta = float("nan")
+            abs_delta = float("nan")
+            eff_md, md_source = resolve_effective_control_deadband(
+                item=item,
+                v_before=None,
+                use_smart_deadband=use_smart_deadband,
+                series_ref_scale=series_ref_scales.get(tag),
+            )
+            is_sig = False
+            action_verb = "결측치 포함"
+
+        results.append(
+            {
+                "item": item,
+                "tag": tag,
+                "label": label,
+                "short_name": short_name,
+                "unit": unit,
+                "unit_str": unit_str,
+                "v_before": v_b,
+                "v_after": v_a,
+                "has_valid_nums": has_valid_nums,
+                "delta": delta,
+                "abs_delta": abs_delta,
+                "eff_min_delta": eff_md,
+                "deadband_source": md_source,
+                "is_significant": is_sig,
+                "action_verb": action_verb,
+            }
+        )
+
+    return results
+
+
 def extract_golden_cases(
     proc_df: pd.DataFrame,
     var_mapping: Dict[str, List[Dict[str, Any]]],
     time_col: Optional[str],
     lookahead_rows: int,
     notes_cache: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None,
+    use_smart_deadband: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
     설정한 모든 KPI의 threshold 조건 및 물리적 유효 범위(valid_min ~ valid_max) 필터 조건을
@@ -1850,6 +2360,18 @@ def extract_golden_cases(
         tag = item["tag"].strip()
         if tag not in numeric_cache:
             numeric_cache[tag] = _coerce_numeric_series(proc_df[tag])
+
+    # 제어 변수별 대표 운전 스케일 사전 계산 (불감대 판정용)
+    ctrl_series_scales: Dict[str, float] = {}
+    for ctrl in control_items:
+        c_tag = ctrl["tag"].strip()
+        if c_tag not in ctrl_series_scales:
+            s_abs = numeric_cache[c_tag].dropna().abs()
+            if not s_abs.empty:
+                nz = s_abs[s_abs > 1e-9]
+                ref_v = float(nz.median()) if not nz.empty else float(s_abs.median())
+                if not math.isnan(ref_v) and not math.isinf(ref_v):
+                    ctrl_series_scales[c_tag] = ref_v
 
     notes_cache = notes_cache or {}
     golden_rows: List[Dict[str, Any]] = []
@@ -1964,8 +2486,10 @@ def extract_golden_cases(
             threshold_excluded_count += 1
             continue
 
-        # 제어 변수(control) 변화 요약 생성
-        ctrl_summary_parts: List[str] = []
+        # 제어 변수(control) 변화 요약 생성 ([핵심 조작 N개] 위주 우선 요약 표시)
+        active_ctrl_parts: List[str] = []
+        held_ctrl_count = 0
+        valid_ctrl_count = 0
         for ctrl in control_items:
             c_tag = ctrl["tag"].strip()
             c_unit = (ctrl.get("unit") or "").strip()
@@ -1974,15 +2498,43 @@ def extract_golden_cases(
             c_before = numeric_cache[c_tag].iloc[i]
             c_after = numeric_cache[c_tag].iloc[j]
             if pd.notna(c_before) and pd.notna(c_after):
-                c_delta = float(c_after - c_before)
-                ctrl_summary_parts.append(
-                    f"{c_label}: {_format_num(c_before)}→{_format_num(c_after)}{c_unit_str} ({_format_signed_delta(c_delta)})"
+                valid_ctrl_count += 1
+                v_b_f = float(c_before)
+                v_a_f = float(c_after)
+                c_delta = float(v_a_f - v_b_f)
+                eff_md, _ = resolve_effective_control_deadband(
+                    item=ctrl,
+                    v_before=v_b_f,
+                    use_smart_deadband=use_smart_deadband,
+                    series_ref_scale=ctrl_series_scales.get(c_tag),
                 )
-        ctrl_summary_str = (
-            " | ".join(ctrl_summary_parts)
-            if ctrl_summary_parts
-            else "(매핑된 제어 변수 없음)"
-        )
+                is_sig = (
+                    (abs(c_delta) > 1e-9)
+                    if eff_md <= 1e-9
+                    else ((abs(c_delta) + 1e-9) >= eff_md)
+                )
+                if is_sig:
+                    active_ctrl_parts.append(
+                        f"{c_label}: {_format_num(v_b_f)}→{_format_num(v_a_f)}{c_unit_str} ({_format_signed_delta(c_delta)})"
+                    )
+                else:
+                    held_ctrl_count += 1
+
+        if valid_ctrl_count == 0:
+            ctrl_summary_str = "(매핑된 제어 변수 없음)"
+        elif active_ctrl_parts:
+            held_suffix = (
+                f" (외 {held_ctrl_count}개 유지)" if held_ctrl_count > 0 else ""
+            )
+            ctrl_summary_str = (
+                f"[핵심 조작 {len(active_ctrl_parts)}개] "
+                + " | ".join(active_ctrl_parts)
+                + held_suffix
+            )
+        else:
+            ctrl_summary_str = (
+                f"[핵심 조작 0개] 전 제어 변수 현행 유지 (불감대 이내 {held_ctrl_count}개 안정 유지)"
+            )
 
         # 상태/제약 변수(state) 요약 생성
         state_summary_parts: List[str] = []
@@ -2110,10 +2662,12 @@ def build_default_sample_notes(
     case_row: pd.Series,
     proc_df: pd.DataFrame,
     var_mapping: Dict[str, List[Dict[str, Any]]],
+    use_smart_deadband: bool = True,
 ) -> Tuple[str, str]:
     """
     도메인 전문가가 보충 멘트 작성 방식을 빠르게 참고할 수 있도록
-    해당 케이스의 실제 수치 변화를 반영한 예시 Expert_Note 및 Action_Reason 문구를 생성합니다.
+    해당 케이스의 실제 수치 변화(유효 불감대 이상의 핵심 조작 변수 우선 반영)를 기반으로
+    예시 Expert_Note 및 Action_Reason 문구를 생성합니다.
     """
     before_idx = int(case_row.get("Before 행", 0))
     after_idx = int(case_row.get("After 행", 0))
@@ -2156,7 +2710,7 @@ def build_default_sample_notes(
         f"{feed_desc}{kpi_desc}. 운전 조건 미세 조정을 통한 수율 및 에너지 원단위 동시 최적화가 필요한 구간임."
     )
 
-    # Action_Reason 예시 조립
+    # Action_Reason 예시 조립 (불감대 이상의 유의미 조작 변수를 우선 선택하여 노이즈 오기재 방지)
     state_desc = "주요 공정 상태 변수가 모두 안전 관리 기준 내에 위치하여"
     if state_items:
         s0 = state_items[0]
@@ -2169,16 +2723,25 @@ def build_default_sample_notes(
 
     ctrl_desc = "제어 변수 설정치를 최적 방향으로 조정함"
     if ctrl_items:
-        c0 = ctrl_items[0]
-        c_tag = c0["tag"].strip()
-        c_name = (c0.get("name") or c_tag).strip()
-        c_unit = (c0.get("unit") or "").strip()
-        v_b = _coerce_numeric_scalar(before_s.get(c_tag))
-        v_a = _coerce_numeric_scalar(after_s.get(c_tag))
-        if pd.notna(v_b) and pd.notna(v_a):
-            diff = float(v_a - v_b)
-            act_word = "상향" if diff > 0 else ("하향" if diff < 0 else "유지")
-            ctrl_desc = f"{c_name}을(를) {_format_num(v_b)}→{_format_num(v_a)} {c_unit}로 {act_word} 조작하여 반응 가혹도 및 열물질 평형을 개선함"
+        ref_scales = compute_series_reference_scales(proc_df, ctrl_items)
+        ctrl_evals = evaluate_control_changes(
+            before_s=before_s,
+            after_s=after_s,
+            control_items=ctrl_items,
+            use_smart_deadband=use_smart_deadband,
+            series_ref_scales=ref_scales,
+        )
+        sig_evals = [ev for ev in ctrl_evals if ev["is_significant"]]
+        if sig_evals:
+            ev0 = sig_evals[0]
+            act_word = "상향" if ev0["delta"] > 0 else "하향"
+            u_str = f" {ev0['unit']}" if ev0["unit"] else ""
+            ctrl_desc = (
+                f"{ev0['short_name']}을(를) {_format_num(ev0['v_before'])}→{_format_num(ev0['v_after'])}{u_str}로 "
+                f"{act_word} 조작하여 반응 가혹도 및 열·물질 평형을 개선함"
+            )
+        else:
+            ctrl_desc = "전 제어 변수를 현행 최적 설정치 범위(불감대 이내)로 안정 유지하여 공정 열·물질 평형을 달성함"
 
     sample_action_reason = f"{state_desc} {ctrl_desc}."
     return sample_expert_note, sample_action_reason
@@ -2192,11 +2755,15 @@ def generate_qa_from_golden_case(
     time_col: Optional[str],
     lookahead_rows: int,
     resample_rule: str,
+    use_smart_deadband: bool = True,
+    control_output_mode: str = CONTROL_OUTPUT_MODE_SUMMARY,
 ) -> Dict[str, str]:
     """
     외부 LLM 없이 순수 파이썬 규칙 기반 템플릿(f-string)으로
     수치 데이터(Before -> After) + 4대 변수 메타정보 + 전문가 보충 멘트(Expert_Note, Action_Reason)를
     결합하여 자연스러운 한국어 문장형 instruction, input, output 사전을 생성합니다.
+    제어 변수(control)의 유효 불감대(Effective Deadband) 이내 미세 노이즈는 절대 '상향/하향 조작'으로 오기재하지 않으며,
+    선택한 control_output_mode(① 핵심 조작 + 유지 요약 분리 / ② 유의미 조작만 출력 / ③ 전체 개별 출력)에 맞춰 권고안을 생성합니다.
     """
     proc_title = (process_name or "").strip() or "화학 공정"
     before_idx = int(case_row.get("Before 행", 0))
@@ -2338,35 +2905,101 @@ def generate_qa_from_golden_case(
             f"{kpi_goal_text}을(를) 달성할 수 있는 운전 구간으로 진단됩니다."
         )
 
-    # 3-2) 제어 변수(Control) 최적 조작 가이드 (Before -> After 수치 변화)
+    # 3-2) 제어 변수(Control) 최적 조작 가이드 (유효 불감대 기반 노이즈 분리 및 3가지 출력 모드 지원)
     ctrl_action_lines: List[str] = []
-    for item in ctrl_items:
-        tag = item["tag"].strip()
-        label = _display_var_label(item)
-        unit = (item.get("unit") or "").strip()
-        unit_str = f" {unit}" if unit else ""
-        v_b = _coerce_numeric_scalar(before_s.get(tag))
-        v_a = _coerce_numeric_scalar(after_s.get(tag))
-        if pd.notna(v_b) and pd.notna(v_a):
-            delta = float(v_a - v_b)
-            if abs(delta) < 1e-9:
-                action_verb = "현재 설정값 유지"
-                delta_desc = f"변화 없음 (0.0{unit_str})"
-            elif delta > 0:
-                action_verb = "상향 조작"
-                delta_desc = f"{_format_signed_delta(delta)}{unit_str} {action_verb}"
-            else:
-                action_verb = "하향 조작"
-                delta_desc = f"{_format_signed_delta(delta)}{unit_str} {action_verb}"
-            ctrl_action_lines.append(
-                f"  - {label}: {_format_num(v_b)}{unit_str} → {_format_num(v_a)}{unit_str} ({delta_desc})"
-            )
+    if not ctrl_items:
+        ctrl_action_lines.append(
+            "  - (등록된 제어/조작 변수가 없습니다. Step 2에서 control 변수를 매핑해 주세요.)"
+        )
+    else:
+        ref_scales = compute_series_reference_scales(proc_df, ctrl_items)
+        ctrl_evals = evaluate_control_changes(
+            before_s=before_s,
+            after_s=after_s,
+            control_items=ctrl_items,
+            use_smart_deadband=use_smart_deadband,
+            series_ref_scales=ref_scales,
+        )
+        active_evals = [ev for ev in ctrl_evals if ev["is_significant"]]
+        held_evals = [
+            ev for ev in ctrl_evals if ev["has_valid_nums"] and not ev["is_significant"]
+        ]
+
+        if control_output_mode == CONTROL_OUTPUT_MODE_ALL_DETAIL:
+            # ③ 전체 제어 변수 개별 출력 (불감대 이내는 '현재 설정값 유지'로 표기)
+            for ev in ctrl_evals:
+                label = ev["label"]
+                unit_str = ev["unit_str"]
+                if ev["has_valid_nums"]:
+                    v_b = ev["v_before"]
+                    v_a = ev["v_after"]
+                    delta = ev["delta"]
+                    if ev["is_significant"]:
+                        delta_desc = f"{_format_signed_delta(delta)}{unit_str} {ev['action_verb']}"
+                    elif abs(delta) <= 1e-9:
+                        delta_desc = f"현재 설정값 유지 — 변화 없음 (0.0{unit_str})"
+                    else:
+                        delta_desc = (
+                            f"현재 설정값 유지 — 불감대 ±{_format_num(ev['eff_min_delta'], 3)}{unit_str} 이내 "
+                            f"계측 노이즈({_format_signed_delta(delta)}{unit_str})"
+                        )
+                    ctrl_action_lines.append(
+                        f"  - {label}: {_format_num(v_b)}{unit_str} → {_format_num(v_a)}{unit_str} ({delta_desc})"
+                    )
+                else:
+                    tag = ev["tag"]
+                    ctrl_action_lines.append(
+                        f"  - {label}: {_format_num(before_s.get(tag))}{unit_str} → {_format_num(after_s.get(tag))}{unit_str} (결측치 포함)"
+                    )
+
+        elif control_output_mode == CONTROL_OUTPUT_MODE_ACTIVE_ONLY:
+            # ② 유의미한 조작 변수만 출력 (유지 변수 생략)
+            for ev in active_evals:
+                label = ev["label"]
+                unit_str = ev["unit_str"]
+                delta_desc = (
+                    f"{_format_signed_delta(ev['delta'])}{unit_str} {ev['action_verb']}"
+                )
+                ctrl_action_lines.append(
+                    f"  - {label}: {_format_num(ev['v_before'])}{unit_str} → {_format_num(ev['v_after'])}{unit_str} ({delta_desc})"
+                )
+            if not ctrl_action_lines:
+                ctrl_action_lines.append(
+                    "  - 유의미한 설정치(SV) 조작 변수 없음 (전 제어 변수 불감대 이내 현행 운전 설정값 안정 유지)"
+                )
+
         else:
-            ctrl_action_lines.append(
-                f"  - {label}: {_format_num(before_s.get(tag))}{unit_str} → {_format_num(after_s.get(tag))}{unit_str}"
-            )
-    if not ctrl_action_lines:
-        ctrl_action_lines.append("  - (등록된 제어/조작 변수가 없습니다. Step 2에서 control 변수를 매핑해 주세요.)")
+            # ① 핵심 조작 변수 + 현행 설정 유지 변수 요약 분리 (기본 권장)
+            for ev in active_evals:
+                label = ev["label"]
+                unit_str = ev["unit_str"]
+                delta_desc = (
+                    f"{_format_signed_delta(ev['delta'])}{unit_str} {ev['action_verb']}"
+                )
+                ctrl_action_lines.append(
+                    f"  - {label}: {_format_num(ev['v_before'])}{unit_str} → {_format_num(ev['v_after'])}{unit_str} ({delta_desc})"
+                )
+            if not active_evals:
+                ctrl_action_lines.append(
+                    "  - 핵심 조작 변수: 유의미한 설정치(SV) 변경 없음 (전 제어 변수 현행 설정값 유지)"
+                )
+
+            if held_evals:
+                held_descs = [
+                    f"{ev['short_name']}({_format_approx_held_value(ev['v_before'], ev['v_after'], ev['unit'])})"
+                    for ev in held_evals
+                ]
+                if len(held_descs) == 1:
+                    held_summary_body = held_descs[0]
+                elif len(held_descs) == 2:
+                    held_summary_body = f"{held_descs[0]}, {held_descs[1]}"
+                else:
+                    held_summary_body = (
+                        f"{held_descs[0]}, {held_descs[1]} 외 {len(held_descs) - 2}개 변수"
+                    )
+                ctrl_action_lines.append(
+                    f"  - 현행 설정값 유지 (계측 노이즈 범위 내 안정 유지): {held_summary_body}"
+                )
 
     # 3-3) 제어 변수 조작 핵심 근거 및 안전 제약 검토 (Action_Reason + State 추이 반영)
     state_check_lines: List[str] = []
@@ -3308,7 +3941,9 @@ def render_step2() -> None:
                             "name": meta_kor_name or col_name,
                             "unit": meta_unit_val,
                         }
-                        if target_cat == "state":
+                        if target_cat == "control":
+                            new_entry["min_delta"] = None
+                        elif target_cat == "state":
                             new_entry["limit_desc"] = ""
                         elif target_cat == "kpi":
                             new_entry["direction"] = "maximize"
@@ -3401,17 +4036,97 @@ def render_step2() -> None:
                         **② 제어/조작 변수 (`control` - Manipulated Variable, MV/SV)**
                         - 운전원이 수율 개선, 품질 확보, 에너지 절감을 위해 **직접 설정치(SV)나 밸브를 조작하는 변수**입니다.
                         - Step 3에서 **Before → After 조작 변화량**을 계산하여 LLM이 **"구체적으로 어떤 변수를 얼마나 조정해야 하는지"** 답변을 생성하는 핵심 항목입니다.
+                        - **최소 조작폭 (`min_delta`, Deadband / 불감대) *(선택 사항)***:
+                          - RTDB 계측값(PV)에는 설정치(SV)를 바꾸지 않아도 `+0.03 °C`, `-0.02 mmHg`, 유량 `±0.1%` 수준의 **PID 미세 헌팅 노이즈**가 항상 존재합니다.
+                          - `min_delta`를 설정하면 `|Δ| < min_delta`인 미세 노이즈를 `"상향/하향 조작"`으로 오기재하지 않고 **`"현행 설정값 유지"`**로 깔끔하게 분리합니다.
+                          - 비워두더라도(`None`) Step 3의 **스마트 기본 불감대 토글**이 단위·스케일을 분석해 자동 처리하며, 아래 **[⚡ 단위/데이터 기반 권장 최소 조작폭 자동 입력]** 버튼으로 현실적인 권장값을 한 번에 채울 수도 있습니다.
 
                         **📌 구체적 입력 예시**
-                        | 태그명 (`tag`) | 한글 명칭 (`name`) | 단위 (`unit`) |
-                        | :--- | :--- | :--- |
-                        | `COT` | 열분해로 출구온도 | `°C` |
-                        | `DSR` | 희석스팀비 | `kg/kg` |
-                        | `FIC-305` | 정류탑 환류 유량 (Reflux) | `t/h` |
-                        | `FIC-310` | 리보일러 스팀 투입량 | `t/h` |
+                        | 태그명 (`tag`) | 한글 명칭 (`name`) | 단위 (`unit`) | 최소 조작폭 (`min_delta`) |
+                        | :--- | :--- | :--- | :--- |
+                        | `COT` | 열분해로 출구온도 | `°C` | `0.5` *(±0.5°C 미만 노이즈 제외)* |
+                        | `DSR` | 희석스팀비 | `kg/kg` | `0.01` |
+                        | `V-10-01 OVHD P` | 탈수탑 상부 진공 압력 | `mmHg` | `0.5` *(300 mmHg 운전 시 `3.0`)* |
+                        | `STM Flow to E-10-02` | 열교환기 스팀 유량 | `kg/hr` | `10.0` *(유량 스케일의 약 1%)* |
                         """
                     )
-            st.caption("COT, DSR, 환류비 등 운전원이 직접 설정값을 조절하는 조작 변수를 입력하세요.")
+            st.caption(
+                "COT, DSR, 스팀 유량 등 운전원이 조절하는 조작 변수와 선택적 최소 조작폭(min_delta, 불감대)을 입력하세요."
+            )
+
+            cur_ctrl_items = st.session_state["var_mapping"].get("control", [])
+            cb_col1, cb_col2 = st.columns([2.2, 1.0])
+            with cb_col1:
+                auto_min_delta_clicked = st.button(
+                    "⚡ 단위/데이터 기반 권장 최소 조작폭 자동 입력",
+                    use_container_width=True,
+                    disabled=(len(cur_ctrl_items) == 0),
+                    help="현재 매핑된 control 변수들의 공학 단위(°C, mmHg, barG, kg/hr, l/hr, t/h 등)와 로드된 CSV 데이터 운전 스케일을 분석하여 현실적인 불감대(min_delta) 권장값을 일괄 입력합니다.",
+                )
+            with cb_col2:
+                clear_min_delta_clicked = st.button(
+                    "🔓 불감대 비우기",
+                    use_container_width=True,
+                    disabled=(len(cur_ctrl_items) == 0),
+                    help="모든 control 변수의 개별 min_delta 값을 비웁니다(None). 비워둔 변수는 Step 3의 스마트 기본 불감대 토글 설정을 따릅니다.",
+                )
+
+            if auto_min_delta_clicked and cur_ctrl_items:
+                scale_src_df = (
+                    proc_df
+                    if (proc_df is not None and not proc_df.empty)
+                    else st.session_state.get("raw_df")
+                )
+                ref_scales = compute_series_reference_scales(scale_src_df, cur_ctrl_items)
+                updated_ctrls: List[Dict[str, Any]] = []
+                preview_pairs: List[str] = []
+                for c_item in cur_ctrl_items:
+                    new_c = dict(c_item)
+                    rec_md = recommend_control_min_delta(
+                        new_c,
+                        df=scale_src_df,
+                        series_ref_scales=ref_scales,
+                    )
+                    new_c["min_delta"] = rec_md
+                    updated_ctrls.append(new_c)
+                    if len(preview_pairs) < 4:
+                        u_txt = f" {new_c.get('unit', '').strip()}" if (new_c.get("unit") or "").strip() else ""
+                        preview_pairs.append(
+                            f"`{new_c.get('tag') or new_c.get('name')}` → `{_format_num(rec_md, 4)}{u_txt}`"
+                        )
+                st.session_state["var_mapping"]["control"] = updated_ctrls
+                sync_editor_base_dfs_from_mapping()
+                scale_note = (
+                    f"CSV 데이터 스케일 반영 {len(ref_scales)}개 포함"
+                    if ref_scales
+                    else "공학 단위 기준 기본값 적용"
+                )
+                sample_tail = (
+                    f" (예: {', '.join(preview_pairs)}"
+                    + (f" 외 {len(updated_ctrls) - len(preview_pairs)}개)" if len(updated_ctrls) > len(preview_pairs) else ")")
+                    if preview_pairs
+                    else ""
+                )
+                st.session_state["preset_flash_type"] = "success"
+                st.session_state["preset_flash_msg"] = (
+                    f"⚡ 제어 변수(`control`) {len(updated_ctrls)}개에 단위/데이터 기반 권장 최소 조작폭(`min_delta`)이 자동 입력되었습니다! [{scale_note}]{sample_tail}"
+                )
+                st.rerun()
+
+            if clear_min_delta_clicked and cur_ctrl_items:
+                cleared_ctrls = []
+                for c_item in cur_ctrl_items:
+                    new_c = dict(c_item)
+                    new_c["min_delta"] = None
+                    cleared_ctrls.append(new_c)
+                st.session_state["var_mapping"]["control"] = cleared_ctrls
+                sync_editor_base_dfs_from_mapping()
+                st.session_state["preset_flash_type"] = "warning"
+                st.session_state["preset_flash_msg"] = (
+                    "🔓 모든 제어 변수(`control`)의 개별 최소 조작폭(`min_delta`) 설정을 비웠습니다 (`None`). Step 3의 스마트 기본 불감대 토글로 자동 노이즈 분리가 가능합니다."
+                )
+                st.rerun()
+
             edited_control_df = st.data_editor(
                 base_dfs["control"],
                 key=f"editor_control_{editor_version}",
@@ -3431,7 +4146,15 @@ def render_step2() -> None:
                     ),
                     "unit": st.column_config.TextColumn(
                         "단위 (unit)",
-                        help="공정 공학 단위 (예: °C, kg/kg, t/h)",
+                        help="공정 공학 단위 (예: °C, mmHg, barG, kg/hr, l/hr, t/h)",
+                    ),
+                    "min_delta": st.column_config.NumberColumn(
+                        "최소 조작폭 (min_delta)",
+                        help="선택 사항(미입력 시 None 허용): PID 계측 노이즈를 제외하고 실제 조작으로 인정할 최소 변화량(|Δ| ≥ min_delta, 예: 온도 0.5 °C, 압력 0.05 barG).",
+                        min_value=0.0,
+                        step=0.05,
+                        format="%.4g",
+                        required=False,
                     ),
                 },
             )
@@ -3926,6 +4649,89 @@ def render_step3() -> None:
                             args=(k_idx, thr_key, vmin_key, vmax_key),
                         )
 
+        # Phase 9: 제어 변수(control) 유효 불감대(Deadband) 및 프롬프트(output) 노이즈 분리 설정 패널
+        with st.expander(
+            "🎛️ 제어 변수(Control) 계측 노이즈 불감대(Deadband) 및 권고 문장(output) 출력 모드 설정",
+            expanded=True,
+        ):
+            db_col1, db_col2 = st.columns([1.85, 2.15])
+            with db_col1:
+                use_smart_deadband = st.toggle(
+                    "🛡️ 미지정 제어 변수(min_delta 미입력)에 단위·스케일 기반 스마트 기본 불감대 자동 적용",
+                    value=bool(st.session_state.get("use_smart_deadband", True)),
+                    help=(
+                        "Step 2에서 개별 min_delta가 지정된 변수는 항상 해당 값을 우선 적용하며, "
+                        "min_delta가 비어 있는(None) 변수에 대해 공학 단위·운전 스케일 기반 기본 불감대"
+                        "(온도 0.5 °C, 압력 barG 0.05 / mmHg 스케일 비례, 유량 Before 대비 1.0% 등)를 자동 적용합니다."
+                    ),
+                )
+                st.session_state["use_smart_deadband"] = bool(use_smart_deadband)
+
+                ctrl_list_cur = var_mapping.get("control", [])
+                explicit_md_cnt = sum(
+                    1
+                    for c_it in ctrl_list_cur
+                    if _parse_optional_nonneg_float(c_it.get("min_delta")) is not None
+                )
+                unset_md_cnt = len(ctrl_list_cur) - explicit_md_cnt
+
+                if ctrl_list_cur:
+                    if use_smart_deadband:
+                        st.caption(
+                            f"📌 현재 `control` 변수 **{len(ctrl_list_cur)}개** 중 개별 `min_delta` 지정 **`{explicit_md_cnt}`개** · "
+                            f"스마트 기본 불감대 자동 적용 **`{unset_md_cnt}`개** "
+                            f"*(온도 `0.5 °C` · 압력 `0.05 barG` / `mmHg` 스케일 비례 · 유량 `Before 대비 1.0%`)*"
+                        )
+                    else:
+                        st.caption(
+                            f"📌 현재 `control` 변수 **{len(ctrl_list_cur)}개** 중 개별 `min_delta` 지정 **`{explicit_md_cnt}`개**만 불감대 적용 "
+                            f"*(미지정 `{unset_md_cnt}`개는 불감대 `0` 처리)*"
+                        )
+                else:
+                    st.caption("*(Step 2에서 매핑된 `control` 변수가 아직 없습니다)*")
+
+                with st.popover(
+                    "❓ 왜 제어 변수 불감대(Deadband)와 노이즈 분리가 중요한가요?",
+                    use_container_width=True,
+                ):
+                    st.markdown(
+                        """
+                        **1. PID 계측 헌팅 노이즈의 잘못된 조작 학습 차단**
+                        - 실제 플랜트 RTDB의 계측값(PV)은 운전원이 설정치(SV)를 전혀 건드리지 않아도 **`+0.03 °C`, `-0.02 mmHg`, 유량 `+0.02%`** 수준의 미세 헌팅 노이즈가 매 시각 기록됩니다.
+                        - 불감대 없이 단순 수치 차이($\\Delta \\neq 0$)만으로 문장을 만들면, `64.98 °C → 65.01 °C (+0.03 °C 상향 조작)`처럼 **계측 노이즈를 운전 조작 지시로 오기재**하여 LLM이 잘못된 인과관계를 학습하게 됩니다.
+
+                        **2. 유효 불감대(Effective Deadband) 우선순위 규칙**
+                        - **1순위**: Step 2 표의 **`최소 조작폭 (min_delta)`**에 숫자가 입력된 변수는 해당 기준값을 최우선 적용합니다.
+                        - **2순위**: `min_delta`가 비어 있는(`None`) 변수는 위 **스마트 기본 불감대 토글**이 켜져 있을 때 공학 단위·스케일을 자동 분석하여 판정합니다:
+                          - **온도 (`°C`)**: `±0.5 °C` (`°F`는 `±1.0 °F`)
+                          - **압력 (`bar` / `barG`)**: `±0.05 barG` (고압 계통은 운전 압력의 `1.0%`)
+                          - **진공 압력 (`mmHg` / `mbar`)**: 운전 스케일 비례 (고진공 `<2 mmHg`는 `0.05 mmHg`, 일반 진공은 `max(0.5, 운전값의 1.0%)`, 예: `300 mmHg → 3.0 mmHg`)
+                          - **유량 (`kg/hr`, `l/hr`, `t/h` 등)**: `Before` 유량 대비 **`±1.0%`**
+
+                        **3. 프롬프트(`output`) 3가지 권고안 출력 모드**
+                        - **① 핵심 조작 + 유지 요약 분리 (기본 권장)**: 실제 조작한 핵심 변수만 수치·방향으로 명확히 지시하고, 노이즈 범위 내 변수는 하단 1줄(`현행 설정값 유지: ... 외 N개 변수`)로 깔끔하게 요약합니다.
+                        - **② 유의미한 조작 변수만 출력**: 유지 변수를 완전히 생략하고 핵심 조작 변수만 간결하게 제시합니다.
+                        - **③ 전체 제어 변수 개별 출력**: 모든 제어 변수를 나열하되, 불감대 이내 변수는 절대 상향/하향으로 쓰지 않고 `'현재 설정값 유지'`로 명시합니다.
+                        """
+                    )
+
+            with db_col2:
+                cur_out_mode = st.session_state.get(
+                    "control_output_mode", CONTROL_OUTPUT_MODE_SUMMARY
+                )
+                out_mode_idx = (
+                    CONTROL_OUTPUT_MODE_OPTIONS.index(cur_out_mode)
+                    if cur_out_mode in CONTROL_OUTPUT_MODE_OPTIONS
+                    else 0
+                )
+                control_output_mode = st.radio(
+                    "📝 프롬프트(output) 내 [2. 제어 변수(Control) 최적 조작 권고안] 출력 모드 선택",
+                    options=CONTROL_OUTPUT_MODE_OPTIONS,
+                    index=out_mode_idx,
+                    help="선택한 모드는 하단 실시간 문장 미리보기와 Step 4의 최종 JSONL 데이터셋 생성에 동일하게 반영됩니다.",
+                )
+                st.session_state["control_output_mode"] = control_output_mode
+
     # [샘플 데이터로 즉시 체험] 버튼 처리
     if sample_load_clicked:
         sample_df = create_sample_ncc_dataframe()
@@ -3986,11 +4792,12 @@ def render_step3() -> None:
             "time_col": str(time_col),
             "lookahead": int(lookahead_val),
             "kpi": var_mapping.get("kpi", []),
-            "control_tags": [x.get("tag") for x in var_mapping.get("control", [])],
-            "state_tags": [x.get("tag") for x in var_mapping.get("state", [])],
+            "control": var_mapping.get("control", []),
+            "state": var_mapping.get("state", []),
+            "use_smart_deadband": bool(use_smart_deadband),
         },
         ensure_ascii=False,
-         sort_keys=True,
+        sort_keys=True,
     )
 
     need_reextract = (
@@ -4008,6 +4815,7 @@ def render_step3() -> None:
             time_col=time_col,
             lookahead_rows=int(lookahead_val),
             notes_cache=st.session_state.get("golden_notes_cache", {}),
+            use_smart_deadband=bool(use_smart_deadband),
         )
         st.session_state["golden_extraction_sig"] = current_sig
         st.session_state["golden_diag_msgs"] = diag_msgs
@@ -4073,7 +4881,12 @@ def render_step3() -> None:
             else golden_base_df.copy()
         )
         for idx, row in working_df.iterrows():
-            sample_exp, sample_act = build_default_sample_notes(row, proc_df, var_mapping)
+            sample_exp, sample_act = build_default_sample_notes(
+                row,
+                proc_df,
+                var_mapping,
+                use_smart_deadband=bool(use_smart_deadband),
+            )
             if not str(row.get("Expert_Note", "")).strip():
                 working_df.at[idx, "Expert_Note"] = sample_exp
             if not str(row.get("Action_Reason", "")).strip():
@@ -4166,8 +4979,8 @@ def render_step3() -> None:
                 width="medium",
             ),
             "제어 변수 변화 (Before→After)": st.column_config.TextColumn(
-                "제어 변수 변화 (Control)",
-                help="Before 시점 대비 After 시점의 제어 변수(control) 수치 변화 요약",
+                "제어 변수 변화 (Control — 핵심 조작 요약)",
+                help="유효 불감대(Deadband)를 초과해 실제로 조작된 [핵심 조작 N개] 변수를 우선 요약 표시하고 불감대 이내 노이즈 변수는 유지 건수로 묶어 보여줍니다.",
                 width="large",
             ),
             "KPI 개선 결과 (Before→After)": st.column_config.TextColumn(
@@ -4281,6 +5094,8 @@ def render_step3() -> None:
         time_col=time_col,
         lookahead_rows=int(lookahead_val),
         resample_rule=resample_rule,
+        use_smart_deadband=bool(use_smart_deadband),
+        control_output_mode=control_output_mode,
     )
 
     with st.container(border=True):
@@ -4409,8 +5224,21 @@ def render_step4() -> None:
                 f"학습셋 `{train_Path_preview}` (**{est_train_cnt}건**) + 검증셋 `{val_path_preview}` (**{est_val_cnt}건**) 분할 생성"
             )
 
+        use_smart_deadband_s4: bool = bool(
+            st.session_state.get("use_smart_deadband", True)
+        )
+        control_output_mode_s4: str = st.session_state.get(
+            "control_output_mode", CONTROL_OUTPUT_MODE_SUMMARY
+        )
+        deadband_badge = (
+            "스마트 기본 불감대 ON"
+            if use_smart_deadband_s4
+            else "개별 min_delta만 적용 (스마트 불감대 OFF)"
+        )
+
         st.info(
             f"📦 **Step 3 선택 샘플**: 총 **`{total_selected}`건**  |  {split_mode_desc}\n\n"
+            f"🎛️ **적용된 제어 권고(`output`) 설정**: `{control_output_mode_s4}` · `{deadband_badge}`\n\n"
             f"🗂️ **LLaMA-Factory 자동 등록 대상**: `{info_path_preview}` (기존 등록 데이터셋 보존 및 병합 업데이트)"
         )
 
@@ -4446,6 +5274,8 @@ def render_step4() -> None:
                         time_col=time_col,
                         lookahead_rows=lookahead_rows,
                         resample_rule=resample_rule,
+                        use_smart_deadband=use_smart_deadband_s4,
+                        control_output_mode=control_output_mode_s4,
                     )
                     all_records.append(qa_item)
 
