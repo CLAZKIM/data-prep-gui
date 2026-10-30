@@ -38,6 +38,12 @@ CONTROL_OUTPUT_MODE_OPTIONS = [
     CONTROL_OUTPUT_MODE_ALL_DETAIL,
 ]
 
+# Phase 10: 원료/투입(feed) 부하 안정성 필터 기준 태그 선택 모드 상수
+FEED_TARGET_AUTO_PRIMARY = "__AUTO_PRIMARY_FEED__"
+FEED_TARGET_ALL_FLOW = "__ALL_FEED_FLOWS__"
+FEED_TARGET_ALL_MAPPED = "__ALL_MAPPED_FEEDS__"
+FEED_TARGET_CUSTOM_MULTI = "__CUSTOM_MULTI_FEEDS__"
+
 
 def ensure_directories() -> None:
     """로컬 및 Docker 컨테이너 환경 호환을 위해 필수 상대 경로 폴더를 자동 생성합니다."""
@@ -187,6 +193,51 @@ def _parse_optional_nonneg_float(val: Any) -> Optional[float]:
     if parsed is None:
         return None
     return max(0.0, float(parsed))
+
+
+def _parse_optional_feed_pct(val: Any) -> Optional[float]:
+    """
+    원료 부하 급변 필터의 최대 허용 부하 변동률(max_feed_change_pct, 예: '5.0', '±5.0%', '')을 파싱합니다.
+    미입력이거나 비활성 표현('', '제한없음', 'off' 등)이면 제한 없음(None)을 반환하고,
+    유효한 수치이면 0.0 이상의 백분율(float) 값을 반환합니다.
+    """
+    if val is None or pd.isna(val):
+        return None
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        if math.isnan(fval) or math.isinf(fval):
+            return None
+        return abs(fval)
+    if isinstance(val, str):
+        cleaned = (
+            val.strip()
+            .replace("±", "")
+            .replace("+/-", "")
+            .replace("%", "")
+            .replace(",", "")
+            .strip()
+        )
+        if not cleaned or cleaned.lower() in (
+            "none",
+            "null",
+            "nan",
+            "-",
+            "off",
+            "제한없음",
+            "제한 없음",
+            "미설정",
+            "비활성",
+            "비활성화",
+        ):
+            return None
+        try:
+            fval = float(cleaned)
+            if math.isnan(fval) or math.isinf(fval):
+                return None
+            return abs(fval)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def category_items_to_df(items: List[Dict[str, Any]], category: str) -> pd.DataFrame:
@@ -441,6 +492,13 @@ def init_session_state() -> None:
         # Phase 9: 제어 변수(control) 불감대(Deadband) 및 프롬프트(output) 노이즈 분리 상태
         "use_smart_deadband": True,
         "control_output_mode": CONTROL_OUTPUT_MODE_SUMMARY,
+        # Phase 10: 무조작 지연 구간 및 원료 부하 급변(Feed Stability) 과도 착시 필터 상태
+        "require_active_control": True,
+        "use_feed_stability_filter": True,
+        "feed_stability_target": FEED_TARGET_AUTO_PRIMARY,
+        "feed_stability_custom_tags": [],
+        "max_feed_change_pct": 5.0,
+        "max_feed_change_pct_input": "5.0",
         # Phase 4: JSONL 학습/검증 분할 생성 및 dataset_info.json 자동 등록 상태
         "dataset_name": "ncc_opt_v1",
         "val_split_pct": 10,
@@ -2310,6 +2368,200 @@ def evaluate_control_changes(
     return results
 
 
+# ------------------------------------------------------------------------------
+# Phase 10 핵심 로직: 원료/투입(feed) 유량 태그 판별, 부하 안정성(Feed Stability) 및 4단계 통합 필터링
+# ------------------------------------------------------------------------------
+def _is_feed_flow_item(item: Dict[str, Any]) -> bool:
+    """
+    매핑된 원료/투입(feed) 항목이 '유량/부하(Flow/Load)' 성격의 태그(예: l/hr, kg/hr, t/h, FI-101, UCO-Feed)인지 판별합니다.
+    온도(°C), 수분/불순물 농도(ppm, %), 압력(bar, mmHg), pH 등 비유량 성질 변수는 제외합니다.
+    """
+    tag = (item.get("tag") or "").strip()
+    name = (item.get("name") or "").strip()
+    unit = (item.get("unit") or "").strip()
+
+    kind = _classify_control_unit_kind(unit=unit, tag=tag, name=name)
+    if kind == "flow":
+        return True
+    if kind in (
+        "temp_c",
+        "temp_f",
+        "press_bar",
+        "press_mpa",
+        "press_kpa",
+        "press_psi",
+        "press_mmhg",
+        "percent",
+        "ph",
+        "ppm",
+        "rpm",
+        "ratio",
+    ):
+        return False
+
+    # 단위가 비어 있는(generic) 경우 태그명/한글명 키워드로 유량 여부 보조 판별
+    combined_lower = f"{tag} {name}".lower()
+    non_flow_keywords = (
+        "temp",
+        "온도",
+        "press",
+        "압력",
+        "moist",
+        "수분",
+        "함량",
+        "농도",
+        "순도",
+        "비중",
+        "밀도",
+        "점도",
+        "조성",
+        "ph",
+        "ppm",
+    )
+    if any(nkw in combined_lower for nkw in non_flow_keywords):
+        return False
+
+    if re.match(r"^f[icqrty]?[-_\d]", tag.lower()):
+        return True
+    if any(
+        fkw in combined_lower
+        for fkw in ("flow", "feed", "load", "유량", "투입량", "공급량", "부하", "원료량")
+    ):
+        return True
+    return False
+
+
+def get_feed_flow_items(
+    proc_df: Optional[pd.DataFrame],
+    var_mapping: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    현재 CSV 데이터프레임에 존재하는 매핑된 전체 feed 항목 리스트와
+    그중 유량(Flow) 성격으로 판별된 feed 유량 항목 리스트를 (valid_feed_items, flow_feed_items)로 반환합니다.
+    """
+    if proc_df is None or proc_df.empty:
+        valid_feeds = [
+            it for it in var_mapping.get("feed", []) if (it.get("tag") or "").strip()
+        ]
+    else:
+        col_set = set(proc_df.columns)
+        valid_feeds = [
+            it
+            for it in var_mapping.get("feed", [])
+            if (it.get("tag") or "").strip() in col_set
+        ]
+
+    flow_feeds = [it for it in valid_feeds if _is_feed_flow_item(it)]
+    if not flow_feeds and valid_feeds:
+        # 단위나 명칭 힌트가 모두 비어 있어 유량 태그가 하나도 분류되지 않은 경우 전체 매핑된 feed를 후보로 사용
+        flow_feeds = list(valid_feeds)
+    return valid_feeds, flow_feeds
+
+
+def resolve_feed_stability_targets(
+    proc_df: Optional[pd.DataFrame],
+    var_mapping: Dict[str, List[Dict[str, Any]]],
+    target_mode: str = FEED_TARGET_AUTO_PRIMARY,
+    custom_tags: Optional[List[str]] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Step 3의 '기준 원료(feed) 태그 선택' 설정을 해석하여
+    실제 부하 변동률을 검사할 대상 feed 항목 리스트와 사람이 읽기 쉬운 설명 문자열을 반환합니다.
+    """
+    valid_feeds, flow_feeds = get_feed_flow_items(proc_df, var_mapping)
+    feed_by_tag = {(it.get("tag") or "").strip(): it for it in valid_feeds}
+    col_set = set(proc_df.columns) if (proc_df is not None and not proc_df.empty) else set()
+
+    mode = (target_mode or FEED_TARGET_AUTO_PRIMARY).strip()
+
+    if mode == FEED_TARGET_AUTO_PRIMARY:
+        if flow_feeds:
+            primary = flow_feeds[0]
+            return [primary], f"주원료 자동 ({_display_var_label(primary)})"
+        return [], "매핑된 feed 변수 없음"
+
+    if mode == FEED_TARGET_ALL_FLOW:
+        if flow_feeds:
+            if len(flow_feeds) == 1:
+                return list(flow_feeds), f"전체 feed 유량 ({_display_var_label(flow_feeds[0])})"
+            return (
+                list(flow_feeds),
+                f"전체 매핑된 feed 유량 태그 ({len(flow_feeds)}개: {_display_var_label(flow_feeds[0])} 외 {len(flow_feeds) - 1}개)",
+            )
+        return [], "매핑된 feed 유량 태그 없음"
+
+    if mode == FEED_TARGET_ALL_MAPPED:
+        if valid_feeds:
+            if len(valid_feeds) == 1:
+                return list(valid_feeds), f"전체 feed 태그 ({_display_var_label(valid_feeds[0])})"
+            return (
+                list(valid_feeds),
+                f"전체 매핑된 feed 태그 ({len(valid_feeds)}개)",
+            )
+        return [], "매핑된 feed 태그 없음"
+
+    if mode == FEED_TARGET_CUSTOM_MULTI:
+        chosen: List[Dict[str, Any]] = []
+        seen: set = set()
+        for raw_t in custom_tags or []:
+            t = str(raw_t or "").strip()
+            if not t or t in seen:
+                continue
+            if t in feed_by_tag:
+                chosen.append(feed_by_tag[t])
+                seen.add(t)
+            elif t in col_set:
+                chosen.append({"tag": t, "name": t, "unit": ""})
+                seen.add(t)
+        if not chosen:
+            return [], "선택된 원료 태그 없음"
+        if len(chosen) == 1:
+            return chosen, _display_var_label(chosen[0])
+        return (
+            chosen,
+            f"선택 원료 태그 {len(chosen)}개 ({_display_var_label(chosen[0])} 외 {len(chosen) - 1}개)",
+        )
+
+    # 개별 특정 태그 지정 ('TAG::<tag_name>' 또는 직접 태그명 문자열 전달)
+    specific_tag = mode[5:].strip() if mode.startswith("TAG::") else mode
+    if specific_tag in feed_by_tag:
+        item = feed_by_tag[specific_tag]
+        return [item], _display_var_label(item)
+    if specific_tag and specific_tag in col_set:
+        item = {"tag": specific_tag, "name": specific_tag, "unit": ""}
+        return [item], specific_tag
+
+    # 이전 프리셋의 태그가 현재 CSV에 없는 경우 주원료 자동으로 안전 폴백
+    if flow_feeds:
+        primary = flow_feeds[0]
+        return [primary], f"주원료 자동 ({_display_var_label(primary)})"
+    return [], "매핑된 feed 변수 없음"
+
+
+def _compute_feed_change_pct(v_before: float, v_after: float) -> float:
+    """
+    Before -> After 원료 투입 값의 상대 변화율(%)을 계산합니다.
+    Before 값이 0(가동 정지 상태)이고 After에서 유량이 투입된 경우 +/-inf로 반환하여 가동 초기 급변을 안전하게 감지합니다.
+    """
+    if abs(v_before) > 1e-9:
+        return ((v_after - v_before) / abs(v_before)) * 100.0
+    if abs(v_after) <= 1e-9:
+        return 0.0
+    return float("inf") if v_after > 0 else float("-inf")
+
+
+def _format_feed_pct_text(pct: float) -> str:
+    """원료 부하 변동률(%)을 부호 포함 문자열(예: '-19.2%', '+0.0%', '가동시작 급변')로 포맷팅합니다."""
+    if math.isnan(pct):
+        return "N/A"
+    if math.isinf(pct):
+        return "+∞% (0→가동 급증)" if pct > 0 else "-∞% (0→급변)"
+    sign = "+" if pct >= 0 else ""
+    if abs(pct) < 0.05:
+        return "+0.0%" if pct >= 0 else "-0.0%"
+    return f"{sign}{pct:.1f}%"
+
+
 def extract_golden_cases(
     proc_df: pd.DataFrame,
     var_mapping: Dict[str, List[Dict[str, Any]]],
@@ -2317,11 +2569,19 @@ def extract_golden_cases(
     lookahead_rows: int,
     notes_cache: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None,
     use_smart_deadband: bool = True,
+    require_active_control: bool = True,
+    use_feed_stability_filter: bool = True,
+    feed_stability_target: str = FEED_TARGET_AUTO_PRIMARY,
+    max_feed_change_pct: Optional[float] = 5.0,
+    feed_stability_custom_tags: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    설정한 모든 KPI의 threshold 조건 및 물리적 유효 범위(valid_min ~ valid_max) 필터 조건을
-    동시에 만족하는 최적 운전 구간(Before 행 -> After 행)을 자동 탐색하여
-    st.data_editor 편집용 DataFrame과 상세 필터링 진단 메시지 리스트를 반환합니다.
+    4단계 도메인 정합성 파이프라인을 순차 적용하여 최적 운전 구간(Before 행 -> After 행)을 자동 탐색합니다:
+      ① KPI 유효 물리 범위(valid_min ~ valid_max) 이탈 제외
+      ② 원료 부하 급변(Feed Stability: ±max_feed_change_pct% 초과 Turn-down/Ramp-up) 과도 착시 구간 제외
+      ③ 모든 KPI 개선 기준(threshold) 미달 제외
+      ④ 무조작 지연 구간(Phase 9 유효 불감대 기준 유의미 제어 조작 변수 = 0개) 제외 (옵션)
+    반환값: (st.data_editor 편집용 DataFrame, 단계별 상세 필터링 진단 리포트 문자열 리스트)
     """
     diagnostics: List[str] = []
     if proc_df is None or proc_df.empty:
@@ -2353,12 +2613,40 @@ def extract_golden_cases(
         for item in var_mapping.get("state", [])
         if (item.get("tag") or "").strip() in proc_df.columns
     ]
+    valid_feed_items, flow_feed_items = get_feed_flow_items(proc_df, var_mapping)
+    monitored_feed_items, monitored_feed_desc = resolve_feed_stability_targets(
+        proc_df=proc_df,
+        var_mapping=var_mapping,
+        target_mode=feed_stability_target,
+        custom_tags=feed_stability_custom_tags,
+    )
+    eff_max_feed_pct = (
+        _parse_optional_feed_pct(max_feed_change_pct)
+        if use_feed_stability_filter
+        else None
+    )
+    feed_filter_active = bool(
+        use_feed_stability_filter
+        and (eff_max_feed_pct is not None)
+        and len(monitored_feed_items) > 0
+    )
+
+    # 표 요약에 표시할 대표 원료 항목 (감시 대상이 있으면 감시 대상, 없으면 유량 feed 항목)
+    summary_feed_items = (
+        monitored_feed_items if monitored_feed_items else flow_feed_items
+    )
 
     # 숫자형 시리즈 사전 변환 ('%', ',' 등 비표준 수치 문자열까지 안전하게 정제 변환)
     numeric_cache: Dict[str, pd.Series] = {}
-    for item in kpi_items + control_items + state_items:
-        tag = item["tag"].strip()
-        if tag not in numeric_cache:
+    for item in (
+        kpi_items
+        + control_items
+        + state_items
+        + valid_feed_items
+        + monitored_feed_items
+    ):
+        tag = (item.get("tag") or "").strip()
+        if tag and tag in proc_df.columns and tag not in numeric_cache:
             numeric_cache[tag] = _coerce_numeric_series(proc_df[tag])
 
     # 제어 변수별 대표 운전 스케일 사전 계산 (불감대 판정용)
@@ -2379,11 +2667,20 @@ def extract_golden_cases(
 
     total_candidate_pairs = n_rows - lookahead_rows
     nan_excluded_count = 0
+    # 4단계 도메인 필터 제외 카운터
     valid_range_excluded_count = 0
     valid_range_excluded_but_thresh_ok_count = 0
+    feed_stability_excluded_count = 0
+    feed_turndown_excluded_count = 0
+    feed_rampup_excluded_count = 0
+    feed_excluded_but_thresh_ok_count = 0
+    feed_illusion_examples: List[str] = []
     threshold_excluded_count = 0
+    zero_active_ctrl_excluded_count = 0
+    zero_active_ctrl_retained_count = 0
+    zero_ctrl_examples: List[str] = []
 
-    # 각 KPI별 필터링 및 최대 개선폭 추적 (유효 범위 필터링 현황 및 기준값 조정 힌트 제공용)
+    # 각 KPI별 필터링 및 최대 개선폭 추적 (유효 범위·안정 부하 통과 구간 내 기준값 조정 힌트 제공용)
     kpi_stats: Dict[str, Dict[str, Any]] = {}
     for kpi in kpi_items:
         k_tag = kpi["tag"].strip()
@@ -2400,21 +2697,31 @@ def extract_golden_cases(
     for i in range(total_candidate_pairs):
         j = i + lookahead_rows
 
-        # 1) 결측치(NaN) 존재 여부 먼저 확인
+        # 0) 결측치(NaN) 존재 여부 먼저 확인
         has_nan = False
         for kpi in kpi_items:
             tag = kpi["tag"].strip()
             if pd.isna(numeric_cache[tag].iloc[i]) or pd.isna(numeric_cache[tag].iloc[j]):
                 has_nan = True
                 break
+        if not has_nan and feed_filter_active:
+            valid_monitored_cnt = sum(
+                1
+                for f_it in monitored_feed_items
+                if pd.notna(numeric_cache[f_it["tag"].strip()].iloc[i])
+                and pd.notna(numeric_cache[f_it["tag"].strip()].iloc[j])
+            )
+            if valid_monitored_cnt == 0:
+                has_nan = True
         if has_nan:
             nan_excluded_count += 1
             continue
 
-        # 2) KPI별 물리적 유효 범위(valid_min ~ valid_max) 및 개선 기준(threshold) 평가
+        # KPI별 수치, 물리적 유효 범위(valid_min ~ valid_max) 및 개선 기준(threshold) 사전 평가
         pair_out_of_valid_range = False
         pair_all_thresh_passed = True
         kpi_summary_parts: List[str] = []
+        pair_kpi_evals: List[Tuple[str, float, bool]] = []
 
         for kpi in kpi_items:
             tag = kpi["tag"].strip()
@@ -2460,33 +2767,82 @@ def extract_golden_cases(
                     st_entry["out_after_cnt"] += 1
                 if is_kpi_thresh_ok:
                     st_entry["out_but_thresh_ok_cnt"] += 1
-            else:
-                if (
-                    st_entry["max_improvement_valid"] is None
-                    or improvement > st_entry["max_improvement_valid"]
-                ):
-                    st_entry["max_improvement_valid"] = improvement
-                if not is_kpi_thresh_ok:
-                    st_entry["below_thresh_in_valid_cnt"] += 1
 
             if not is_kpi_thresh_ok:
                 pair_all_thresh_passed = False
 
+            pair_kpi_evals.append((tag, improvement, is_kpi_thresh_ok))
             kpi_summary_parts.append(
                 f"{label}: {_format_num(v_before)}→{_format_num(v_after)}{unit_str} ({_format_signed_delta(raw_delta)}{unit_str})"
             )
 
+        # Stage ①: KPI 유효 물리 범위(valid_min ~ valid_max) 이탈 제외
         if pair_out_of_valid_range:
             valid_range_excluded_count += 1
             if pair_all_thresh_passed:
                 valid_range_excluded_but_thresh_ok_count += 1
             continue
 
+        # Stage ②: 원료/투입(feed) 부하 급변(Turn-down / Ramp-up) 과도 구간 제외
+        if feed_filter_active and eff_max_feed_pct is not None:
+            violating_feeds: List[Dict[str, Any]] = []
+            for f_item in monitored_feed_items:
+                f_tag = f_item["tag"].strip()
+                fb_val = numeric_cache[f_tag].iloc[i]
+                fa_val = numeric_cache[f_tag].iloc[j]
+                if pd.isna(fb_val) or pd.isna(fa_val):
+                    continue
+                fb_f = float(fb_val)
+                fa_f = float(fa_val)
+                pct_chg = _compute_feed_change_pct(fb_f, fa_f)
+                if abs(pct_chg) > eff_max_feed_pct + 1e-9:
+                    violating_feeds.append(
+                        {
+                            "tag": f_tag,
+                            "label": (f_item.get("name") or f_tag).strip(),
+                            "unit": (f_item.get("unit") or "").strip(),
+                            "v_before": fb_f,
+                            "v_after": fa_f,
+                            "pct": pct_chg,
+                        }
+                    )
+
+            if violating_feeds:
+                feed_stability_excluded_count += 1
+                worst_v = max(violating_feeds, key=lambda x: abs(x["pct"]))
+                if worst_v["pct"] < 0:
+                    feed_turndown_excluded_count += 1
+                else:
+                    feed_rampup_excluded_count += 1
+
+                if pair_all_thresh_passed:
+                    feed_excluded_but_thresh_ok_count += 1
+                    if len(feed_illusion_examples) < 3:
+                        b_ts = _format_time_value(proc_df.iloc[i], time_col, i)
+                        a_ts = _format_time_value(proc_df.iloc[j], time_col, j)
+                        w_unit = f" {worst_v['unit']}" if worst_v["unit"] else ""
+                        feed_illusion_examples.append(
+                            f"`{b_ts} → {a_ts}` (`{worst_v['tag']}`: {_format_num(worst_v['v_before'])}→{_format_num(worst_v['v_after'])}{w_unit}, **{_format_feed_pct_text(worst_v['pct'])}**)"
+                        )
+                continue
+
+        # 유효 물리 범위(①) 및 원료 부하 안정(②)을 모두 통과한 정상 후보 구간에 대해 KPI 최대 개선폭/미달 통계 누적
+        for k_tag_ev, imp_ev, thr_ok_ev in pair_kpi_evals:
+            st_entry = kpi_stats[k_tag_ev]
+            if (
+                st_entry["max_improvement_valid"] is None
+                or imp_ev > st_entry["max_improvement_valid"]
+            ):
+                st_entry["max_improvement_valid"] = imp_ev
+            if not thr_ok_ev:
+                st_entry["below_thresh_in_valid_cnt"] += 1
+
+        # Stage ③: KPI 개선 기준(threshold) 미달 제외
         if not pair_all_thresh_passed:
             threshold_excluded_count += 1
             continue
 
-        # 제어 변수(control) 변화 요약 생성 ([핵심 조작 N개] 위주 우선 요약 표시)
+        # 제어 변수(control) 변화 평가 (Phase 9 유효 불감대 기준 [핵심 조작 N개] 판정)
         active_ctrl_parts: List[str] = []
         held_ctrl_count = 0
         valid_ctrl_count = 0
@@ -2520,6 +2876,21 @@ def extract_golden_cases(
                 else:
                     held_ctrl_count += 1
 
+        before_row = proc_df.iloc[i]
+        after_row = proc_df.iloc[j]
+        before_time_str = _format_time_value(before_row, time_col, i)
+        after_time_str = _format_time_value(after_row, time_col, j)
+
+        # Stage ④: 유의미 제어 조작 없음(0개 조작 — 무조작 우연/지연 개선 구간) 제외 필터
+        if len(control_items) > 0 and len(active_ctrl_parts) == 0:
+            if require_active_control:
+                zero_active_ctrl_excluded_count += 1
+                if len(zero_ctrl_examples) < 3:
+                    zero_ctrl_examples.append(f"`{before_time_str} → {after_time_str}`")
+                continue
+            else:
+                zero_active_ctrl_retained_count += 1
+
         if valid_ctrl_count == 0:
             ctrl_summary_str = "(매핑된 제어 변수 없음)"
         elif active_ctrl_parts:
@@ -2535,6 +2906,31 @@ def extract_golden_cases(
             ctrl_summary_str = (
                 f"[핵심 조작 0개] 전 제어 변수 현행 유지 (불감대 이내 {held_ctrl_count}개 안정 유지)"
             )
+
+        # 원료 부하(feed) 추이 요약 생성
+        feed_summary_parts: List[str] = []
+        for f_idx, f_item in enumerate(summary_feed_items):
+            if f_idx >= 3:
+                break
+            f_tag = f_item["tag"].strip()
+            f_unit = (f_item.get("unit") or "").strip()
+            f_unit_str = f" {f_unit}" if f_unit else ""
+            f_label = (f_item.get("name") or f_tag).strip()
+            fb_v = numeric_cache[f_tag].iloc[i]
+            fa_v = numeric_cache[f_tag].iloc[j]
+            if pd.notna(fb_v) and pd.notna(fa_v):
+                fb_f = float(fb_v)
+                fa_f = float(fa_v)
+                f_pct = _compute_feed_change_pct(fb_f, fa_f)
+                feed_summary_parts.append(
+                    f"{f_label}: {_format_num(fb_f)}→{_format_num(fa_f)}{f_unit_str} ({_format_feed_pct_text(f_pct)})"
+                )
+        if feed_summary_parts:
+            extra_f_cnt = max(0, len(summary_feed_items) - len(feed_summary_parts))
+            extra_f_note = f" (외 {extra_f_cnt}개)" if extra_f_cnt > 0 else ""
+            feed_summary_str = " | ".join(feed_summary_parts) + extra_f_note
+        else:
+            feed_summary_str = "(매핑된 원료 변수 없음)"
 
         # 상태/제약 변수(state) 요약 생성
         state_summary_parts: List[str] = []
@@ -2557,11 +2953,6 @@ def extract_golden_cases(
             else "(매핑된 상태 변수 없음)"
         )
 
-        before_row = proc_df.iloc[i]
-        after_row = proc_df.iloc[j]
-        before_time_str = _format_time_value(before_row, time_col, i)
-        after_time_str = _format_time_value(after_row, time_col, j)
-
         cached = notes_cache.get((i, j), {})
         include_flag = bool(cached.get("포함 여부", True))
         expert_note = str(cached.get("Expert_Note", "") or "")
@@ -2575,6 +2966,7 @@ def extract_golden_cases(
                 "After 행": int(j),
                 "Before 시점": before_time_str,
                 "After 시점": after_time_str,
+                "원료 부하 추이 (Before→After)": feed_summary_str,
                 "제어 변수 변화 (Before→After)": ctrl_summary_str,
                 "KPI 개선 결과 (Before→After)": " | ".join(kpi_summary_parts),
                 "상태/제약 추이": state_summary_str,
@@ -2584,24 +2976,109 @@ def extract_golden_cases(
         )
         case_seq += 1
 
-    # 3) 필터링 현황 요약 및 KPI별 진단 메시지 구성 (추출 0건일 때와 유효 범위/기준값 제외 발생 시 모두 활용)
-    illusion_clause = (
-        f" — 이 중 개선 기준(`threshold`)은 충족했으나 물리적 유효 범위 이탈로 제외된 착시/과도 구간 **`{valid_range_excluded_but_thresh_ok_count:,}`건**"
-        if valid_range_excluded_but_thresh_ok_count > 0
-        else ""
-    )
+    # --------------------------------------------------------------------------
+    # 단계별 통합 필터링 진단 리포트 구성 (① 물리 유효범위 · ② 원료 부하 급변 · ③ KPI 기준미달 · ④ 무조작 제외)
+    # --------------------------------------------------------------------------
     nan_clause = (
         f" | 결측치(NaN) 제외: `{nan_excluded_count:,}`건"
         if nan_excluded_count > 0
         else ""
     )
     diagnostics.append(
-        f"• **전체 필터링 현황 요약**: 총 비교 구간 `{total_candidate_pairs:,}`쌍 중 → "
-        f"**최종 추출 `{len(golden_rows):,}`건** | "
-        f"개선 기준(`threshold`) 미달 제외: `{threshold_excluded_count:,}`건 | "
-        f"KPI 유효 물리 범위(`valid_min`~`valid_max`) 이탈 제외: **`{valid_range_excluded_count:,}`건**{illusion_clause}{nan_clause}"
+        f"• **통합 4단계 필터링 현황 요약**: 전체 비교 후보 `{total_candidate_pairs:,}`쌍 중 → "
+        f"**최종 골든 케이스 `{len(golden_rows):,}`건 추출** "
+        f"(① 물리 범위 이탈 `{valid_range_excluded_count:,}`건 · "
+        f"② 원료 부하 급변 `{feed_stability_excluded_count:,}`건 · "
+        f"③ KPI 기준 미달 `{threshold_excluded_count:,}`건 · "
+        f"④ 무조작 `0개 조작` `{zero_active_ctrl_excluded_count:,}`건 제외{nan_clause})"
     )
 
+    # ① KPI 유효 물리 범위 단계 상세
+    any_valid_range_cfg = any(
+        _parse_optional_float(k.get("valid_min")) is not None
+        or _parse_optional_float(k.get("valid_max")) is not None
+        for k in kpi_items
+    )
+    if any_valid_range_cfg:
+        vr_illusion_note = (
+            f" — 이 중 KPI 개선 기준(`threshold`)은 충족했으나 물리 범위 이탈로 차단된 착시 구간 **`{valid_range_excluded_but_thresh_ok_count:,}`건**"
+            if valid_range_excluded_but_thresh_ok_count > 0
+            else ""
+        )
+        diagnostics.append(
+            f"  - **① KPI 유효 물리 범위(`valid_min`~`valid_max`) 이탈 제외**: **`{valid_range_excluded_count:,}`건**{vr_illusion_note}"
+        )
+    else:
+        diagnostics.append(
+            "  - **① KPI 유효 물리 범위(`valid_min`~`valid_max`) 이탈 제외**: `0`건 *(현재 설정된 유효 물리 범위 제한 없음)*"
+        )
+
+    # ② 원료 부하 급변(Feed Stability) 과도 구간 단계 상세
+    if feed_filter_active and eff_max_feed_pct is not None:
+        dir_breakdown = (
+            f" (감량 Turn-down `{feed_turndown_excluded_count:,}`건 · 증량 Ramp-up `{feed_rampup_excluded_count:,}`건)"
+            if feed_stability_excluded_count > 0
+            else ""
+        )
+        if feed_excluded_but_thresh_ok_count > 0:
+            ex_tail = (
+                f": {', '.join(feed_illusion_examples)}"
+                + (
+                    f" 외 {feed_excluded_but_thresh_ok_count - len(feed_illusion_examples)}건"
+                    if feed_excluded_but_thresh_ok_count > len(feed_illusion_examples)
+                    else ""
+                )
+            )
+            feed_illusion_note = (
+                f" — 이 중 KPI 개선 기준(`threshold`)을 충족했으나 부하 전환 과도 착시로 차단 **`{feed_excluded_but_thresh_ok_count:,}`건**{ex_tail}"
+            )
+        else:
+            feed_illusion_note = ""
+        diagnostics.append(
+            f"  - **② 원료 부하 급변(`Feed Stability`, {monitored_feed_desc} `±{_format_num(eff_max_feed_pct, 3)}%` 초과) 과도 구간 제외**: "
+            f"**`{feed_stability_excluded_count:,}`건**{dir_breakdown}{feed_illusion_note}"
+        )
+    elif not use_feed_stability_filter or eff_max_feed_pct is None:
+        diagnostics.append(
+            "  - **② 원료 부하 급변(`Feed Stability`) 과도 구간 제외**: `0`건 *(필터 비활성화 / 최대 허용 부하 변동률 제한 없음)*"
+        )
+    else:
+        diagnostics.append(
+            f"  - **② 원료 부하 급변(`Feed Stability`) 과도 구간 제외**: `0`건 *(감시할 기준 원료 태그 없음: {monitored_feed_desc})*"
+        )
+
+    # ③ KPI 개선 기준(threshold) 미달 단계 상세
+    diagnostics.append(
+        f"  - **③ KPI 개선 기준(`threshold`) 미달 제외**: **`{threshold_excluded_count:,}`건** *(유효 물리 범위 및 원료 부하 안정 통과 구간 중)*"
+    )
+
+    # ④ 유의미 제어 조작 없음(0개 조작) 단계 상세
+    if not control_items:
+        diagnostics.append(
+            "  - **④ 유의미 제어 조작 없음(`0개 조작`) 제외**: `0`건 *(Step 2에 매핑된 `control` 변수가 없어 필터 보류됨)*"
+        )
+    elif require_active_control:
+        zc_ex_note = ""
+        if zero_ctrl_examples:
+            zc_ex_note = f" (차단 구간 예: {', '.join(zero_ctrl_examples)}" + (
+                f" 외 {zero_active_ctrl_excluded_count - len(zero_ctrl_examples)}건)"
+                if zero_active_ctrl_excluded_count > len(zero_ctrl_examples)
+                else ")"
+            )
+        diagnostics.append(
+            f"  - **④ 유의미 제어 조작 없음(`0개 조작`, 불감대 이내 전 제어 변수 유지) 제외**: **`{zero_active_ctrl_excluded_count:,}`건**{zc_ex_note}"
+        )
+    else:
+        retained_note = (
+            f" — 현재 최종 추출 결과 내에 **`0개 조작` 구간 `{zero_active_ctrl_retained_count:,}`건**이 포함되어 있습니다"
+            if zero_active_ctrl_retained_count > 0
+            else " — 추출 결과 내 `0개 조작` 구간 없음"
+        )
+        diagnostics.append(
+            f"  - **④ 유의미 제어 조작 없음(`0개 조작`) 제외**: `0`건 *(필터 체크 해제됨{retained_note})*"
+        )
+
+    # KPI별 세부 최대 개선폭 및 기준값 조정 참고 정보
     for kpi in kpi_items:
         tag = kpi["tag"].strip()
         label = _display_var_label(kpi)
@@ -2624,28 +3101,28 @@ def extract_golden_cases(
         below_cnt = st_entry["below_thresh_in_valid_cnt"]
 
         if best_valid is not None:
-            max_desc = f"유효 범위 내 최대 {dir_kor} = `{_format_num(best_valid, 3)}{unit_str}`"
+            max_desc = f"정상 유효 구간 내 최대 {dir_kor} = `{_format_num(best_valid, 3)}{unit_str}`"
             if (
                 best_raw is not None
-                and out_pairs > 0
+                and (out_pairs > 0 or feed_stability_excluded_count > 0)
                 and abs(best_raw - best_valid) > 1e-6
             ):
-                max_desc += f" *(유효 범위 필터 전 원본 최대: `{_format_num(best_raw, 3)}{unit_str}`)*"
+                max_desc += f" *(필터 전 원본 최대: `{_format_num(best_raw, 3)}{unit_str}`)*"
         elif best_raw is not None:
             max_desc = (
-                f"유효 범위 내 만족 구간 없음 *(유효 범위 필터 전 원본 최대 {dir_kor} = `{_format_num(best_raw, 3)}{unit_str}`)*"
+                f"정상 유효 구간 내 만족 구간 없음 *(필터 전 원본 최대 {dir_kor} = `{_format_num(best_raw, 3)}{unit_str}`)*"
             )
         else:
             max_desc = "유효 수치 데이터 없음"
 
         range_excl_detail = (
-            f"유효 범위 이탈 제외 `{out_pairs:,}`건 (Before 이탈 {out_b:,}건, After 이탈 {out_a:,}건, 기준충족 착시 제외 {out_thresh_ok:,}건)"
+            f"물리 범위 이탈 `{out_pairs:,}`건 (Before {out_b:,}건, After {out_a:,}건, 기준충족 착시 {out_thresh_ok:,}건)"
             if (v_min is not None or v_max is not None)
-            else "유효 범위 제한 없음"
+            else "물리 범위 제한 없음"
         )
         diagnostics.append(
-            f"• **{label}**: 기준값(`threshold`) = `{thresh}{unit_str}`, 유효 범위 = `{range_str}` | "
-            f"{range_excl_detail}, 기준값 미달 `{below_cnt:,}`건 | {max_desc}"
+            f"• **[KPI 상세] {label}**: 기준값(`threshold`) = `{thresh}{unit_str}`, 유효 범위 = `{range_str}` | "
+            f"{range_excl_detail}, 안정 구간 내 기준 미달 `{below_cnt:,}`건 | {max_desc}"
         )
 
     if not golden_rows:
@@ -4443,7 +4920,9 @@ def render_step3() -> None:
     with st.container(border=True):
         top_h_col, top_help_col = st.columns([3, 1])
         with top_h_col:
-            st.markdown("##### ⏭️ 비교 시점 간격 (`lookahead_rows`) 설정 및 KPI 물리적 유효 범위(이상치 제외) 필터")
+            st.markdown(
+                "##### ⏭️ 비교 시점 간격 (`lookahead_rows`) 설정 및 4단계 도메인 정합성 필터"
+            )
         with top_help_col:
             with st.popover("❓ 비교 시점 간격(Lookahead)이란?", use_container_width=True):
                 st.markdown(
@@ -4459,9 +4938,11 @@ def render_step3() -> None:
 
                     ---
 
-                    **🛡️ 2. KPI 물리적 유효 범위 (`valid_min` ~ `valid_max`) 필터란?**
-                    - 원료 투입량을 급격히 줄이는 감량 운전 시 탑/반응기 내부 체류량(Holdup)이 일시 배출되면서 순간 계산 수율이 **`100%`를 초과(예: `105%`, `128%`)**하는 등 물리적으로 불가능한 **착시 구간(Artefact)**이 발생할 수 있습니다.
-                    - KPI별로 `유효 최소값(valid_min)` / `유효 최대값(valid_max)`을 설정하면 **Before 또는 After 시점 중 하나라도 유효 범위를 벗어난 이상치 구간을 골든 케이스에서 자동으로 제외**합니다 (비워두면 제한 없음).
+                    **🛡️ 2. 4단계 도메인 정합성 필터 파이프라인**
+                    1. **① KPI 물리적 유효 범위 (`valid_min` ~ `valid_max`)**: 홀드업 배출 등으로 순간 수율이 `100%`를 초과하는 등 물리적으로 불가능한 이상치 구간을 차단합니다.
+                    2. **② 원료 부하 안정성 (`Feed Stability`)**: 원료 급감(Turn-down, 예: `-19.2%`) 시 수율이 `100%` 이하 범위에서 급등하고 절대 스팀 유량만 단순 감소하는 과도 착시 구간을 차단합니다.
+                    3. **③ KPI 개선 기준 (`threshold`)**: 설정된 모든 KPI가 최소 목표치 이상 동시 개선된 구간만 선별합니다.
+                    4. **④ 최소 유의미 제어 조작 (`≥ 1개`)**: 불감대(Deadband) 기준으로 모든 제어 변수가 유지(`0개 조작`)된 지연 응답·외란 우연 개선 구간을 차단합니다.
                     """
                 )
 
@@ -4501,9 +4982,33 @@ def render_step3() -> None:
             else:
                 kpi_cond_text = "*(Step 2에서 설정된 KPI 없음)*"
 
+            preview_use_fs = bool(st.session_state.get("use_feed_stability_filter", True))
+            preview_max_fp = _parse_optional_feed_pct(
+                st.session_state.get("max_feed_change_pct_input", "5.0")
+            )
+            _, preview_feed_desc = resolve_feed_stability_targets(
+                proc_df=proc_df,
+                var_mapping=var_mapping,
+                target_mode=st.session_state.get(
+                    "feed_stability_target", FEED_TARGET_AUTO_PRIMARY
+                ),
+                custom_tags=st.session_state.get("feed_stability_custom_tags", []),
+            )
+            if preview_use_fs and preview_max_fp is not None:
+                fs_badge_txt = f"원료 부하 안정 `{preview_feed_desc} ±{_format_num(preview_max_fp, 3)}% 이내`"
+            else:
+                fs_badge_txt = "원료 부하 제한 없음"
+
+            ctrl_req_badge = (
+                "핵심 제어 조작 `≥ 1개`"
+                if bool(st.session_state.get("require_active_control", True))
+                else "무조작(`0개 조작`) 허용"
+            )
+
             st.info(
                 f"🕒 **비교 시점**: Before($t$) 대비 **{interval_desc}** After($t+{int(lookahead_val)}$) 비교\n\n"
-                f"🎯 **동시 만족 필터 조건**: {kpi_cond_text}"
+                f"🎯 **KPI 조건**: {kpi_cond_text}\n\n"
+                f"🚧 **도메인 정합성 조건**: {fs_badge_txt}  |  {ctrl_req_badge}"
             )
 
         with l_col3:
@@ -4732,6 +5237,245 @@ def render_step3() -> None:
                 )
                 st.session_state["control_output_mode"] = control_output_mode
 
+        # Phase 10: 무조작 지연 구간(최소 유의미 조작 ≥ 1개) 및 원료 부하 급변(Feed Stability) 과도 착시 제외 필터 패널
+        with st.expander(
+            "🚧 무조작 지연 구간(`최소 유의미 조작 ≥ 1개`) 및 원료 부하 급변(`Feed Stability`) 과도 착시 제외 필터",
+            expanded=True,
+        ):
+            p10_col_ctrl, p10_col_feed = st.columns([1.45, 2.15])
+
+            with p10_col_ctrl:
+                st.markdown("**④ 무조작 우연/지연 개선 구간 제외 필터**")
+                require_active_control = st.checkbox(
+                    "유의미한 제어 변수 조작이 최소 1개 이상 있는 구간만 추출",
+                    value=bool(st.session_state.get("require_active_control", True)),
+                    help=(
+                        "위 불감대(Deadband) 기준으로 모든 control 변수가 유지 상태(유의미 조작 변수 = 0개)인데 "
+                        "이전 시간대 조작의 지연 응답이나 외란만으로 KPI가 개선된 구간이 잘못된 인과관계 학습 샘플로 포함되지 않도록 제외합니다."
+                    ),
+                )
+                st.session_state["require_active_control"] = bool(require_active_control)
+
+                if not var_mapping.get("control"):
+                    st.caption(
+                        "💡 *현재 Step 2에 매핑된 `control` 변수가 없어 이 필터는 일시 보류되며, `control` 변수 매핑 시 즉시 작동합니다.*"
+                    )
+                elif require_active_control:
+                    st.caption(
+                        "📌 유효 불감대(Deadband)를 초과한 **`[핵심 조작 ≥ 1개]`** 구간만 선별합니다 (`[핵심 조작 0개]` 무조작 구간 자동 제외)."
+                    )
+                else:
+                    st.caption(
+                        "🔓 무조작 구간 필터 해제됨 — 전 제어 변수가 불감대 이내 유지(`0개 조작`)된 구간도 추출 결과에 포함됩니다."
+                    )
+
+                with st.popover(
+                    "❓ 왜 무조작 구간과 원료 부하 급변 구간을 제외하나요?",
+                    use_container_width=True,
+                ):
+                    st.markdown(
+                        """
+                        **1. 무조작 지연 응답 착시 (`유의미 조작 변수 = 0개`) 차단**
+                        - 연속 공정에서는 이전 시간대($t-1 \\rightarrow t$)에 수행한 온도·스팀 조작의 열적·물질적 지연 응답으로 인해, 현재 구간($t \\rightarrow t+1$)에서는 **운전원이 아무 제어 변수도 조작하지 않았음(`핵심 조작 0개`)**에도 KPI가 추가 개선되는 경우가 발생합니다.
+                        - 이러한 구간을 그대로 학습 데이터에 넣으면 LLM이 *"현행 설정값을 그대로 유지하기만 해도 수율이 상승하고 스팀이 절감된다"*는 잘못된 인과관계를 학습하게 됩니다.
+
+                        **2. 원료 부하 급변 (`Feed Turn-down / Ramp-up`) 과도 착시 차단**
+                        - 원료 투입 유량을 급감(예: `UCO-Feed 5,479 → 4,429 l/hr, -19.2%`)하는 부하 전환 구간에서는 탑·반응기 내부 홀드업(Holdup) 잔류량이 일시 배출되면서 순간 계산 수율이 **`100%` 이하의 정상 범위 내에서도 급등(예: `85.2% → 97.1%`)**할 수 있습니다.
+                        - 동시에 원료량이 19% 줄었기 때문에 총 스팀 절대 유량(`kg/hr`)도 소폭 감소(예: `-2.7%`)하여 KPI `minimize` 조건을 통과하지만, **실제 원료 톤당 스팀 원단위는 오히려 악화**된 과도 착시 구간입니다.
+                        - 기준 원료(`feed`)의 허용 부하 변동률(예: **`±5.0%`**)을 설정하면 이러한 감량(Turn-down)/증량(Ramp-up) 과도 구간을 원천 차단하고 **정상 부하(Steady-load) 최적 운전 구간**만 정확히 추출합니다.
+                        """
+                    )
+
+            with p10_col_feed:
+                st.markdown("**② 원료/투입(`feed`) 부하 급변 과도 구간 제외 필터 (`Feed Stability Filter`)**")
+                fs_top_c1, fs_top_c2, fs_top_c3 = st.columns([2.1, 0.95, 0.95])
+                with fs_top_c1:
+                    use_feed_stability_filter = st.checkbox(
+                        "원료 부하 급변(Turn-down / Ramp-up) 과도 구간 제외 필터 사용",
+                        value=bool(
+                            st.session_state.get("use_feed_stability_filter", True)
+                        ),
+                        help="체크 해제하거나 허용 변동률을 비워두면 원료 부하 변동률 제한을 적용하지 않습니다.",
+                    )
+                    st.session_state["use_feed_stability_filter"] = bool(
+                        use_feed_stability_filter
+                    )
+                with fs_top_c2:
+                    preset_5pct_clicked = st.button(
+                        "⚡ ±5.0% 권장값",
+                        use_container_width=True,
+                        help="정상 부하 판정에 널리 쓰이는 최대 허용 부하 변동률 ±5.0%를 입력하고 필터를 활성화합니다.",
+                    )
+                with fs_top_c3:
+                    clear_feed_pct_clicked = st.button(
+                        "🔓 제한 해제",
+                        use_container_width=True,
+                        help="최대 허용 부하 변동률 입력값을 비워 부하 변동 제한을 해제합니다.",
+                    )
+
+                if preset_5pct_clicked:
+                    st.session_state["use_feed_stability_filter"] = True
+                    st.session_state["max_feed_change_pct_input"] = "5.0"
+                    st.session_state["max_feed_change_pct"] = 5.0
+                    st.rerun()
+
+                if clear_feed_pct_clicked:
+                    st.session_state["max_feed_change_pct_input"] = ""
+                    st.session_state["max_feed_change_pct"] = None
+                    st.rerun()
+
+                valid_feed_items_ui, flow_feed_items_ui = get_feed_flow_items(
+                    proc_df, var_mapping
+                )
+                feed_target_options: List[str] = [
+                    FEED_TARGET_AUTO_PRIMARY,
+                    FEED_TARGET_ALL_FLOW,
+                ]
+                feed_target_labels: Dict[str, str] = {}
+
+                if flow_feed_items_ui:
+                    p_feed = flow_feed_items_ui[0]
+                    p_u = (p_feed.get("unit") or "").strip()
+                    p_u_str = f" [{p_u}]" if p_u else ""
+                    feed_target_labels[FEED_TARGET_AUTO_PRIMARY] = (
+                        f"🎯 주원료 자동 선택 — {_display_var_label(p_feed)}{p_u_str}"
+                    )
+                else:
+                    feed_target_labels[FEED_TARGET_AUTO_PRIMARY] = (
+                        "🎯 주원료 자동 선택 (Step 2에서 feed 매핑 시 자동 연동)"
+                    )
+
+                feed_target_labels[FEED_TARGET_ALL_FLOW] = (
+                    f"🌊 전체 매핑된 feed 유량 태그 ({len(flow_feed_items_ui)}개 동시 검사)"
+                )
+
+                if len(valid_feed_items_ui) > len(flow_feed_items_ui):
+                    feed_target_options.append(FEED_TARGET_ALL_MAPPED)
+                    feed_target_labels[FEED_TARGET_ALL_MAPPED] = (
+                        f"📦 전체 매핑된 feed 태그 ({len(valid_feed_items_ui)}개 — 온도·조성 포함)"
+                    )
+
+                flow_tag_set_ui = {
+                    (it.get("tag") or "").strip() for it in flow_feed_items_ui
+                }
+                for f_it in valid_feed_items_ui:
+                    f_t = (f_it.get("tag") or "").strip()
+                    if not f_t:
+                        continue
+                    opt_k = f"TAG::{f_t}"
+                    f_u = (f_it.get("unit") or "").strip()
+                    f_u_str = f" [{f_u}]" if f_u else ""
+                    role_hint = " (유량)" if f_t in flow_tag_set_ui else " (조건/성질)"
+                    feed_target_options.append(opt_k)
+                    feed_target_labels[opt_k] = (
+                        f"📌 특정 주원료 태그: {_display_var_label(f_it)}{f_u_str}{role_hint}"
+                    )
+
+                # Step 2에 아직 feed를 매핑하지 않았으나 CSV가 로드된 경우 CSV 수치 컬럼 직접 선택도 지원
+                if not valid_feed_items_ui and proc_df is not None and not proc_df.empty:
+                    for c_name in proc_df.columns:
+                        if c_name == time_col:
+                            continue
+                        if pd.api.types.is_numeric_dtype(proc_df[c_name]):
+                            opt_k = f"TAG::{c_name}"
+                            feed_target_options.append(opt_k)
+                            feed_target_labels[opt_k] = f"📌 CSV 컬럼 직접 선택: {c_name}"
+
+                if len(valid_feed_items_ui) >= 2:
+                    feed_target_options.append(FEED_TARGET_CUSTOM_MULTI)
+                    feed_target_labels[FEED_TARGET_CUSTOM_MULTI] = (
+                        "🎛️ 복수 원료 태그 직접 선택..."
+                    )
+
+                saved_target = st.session_state.get(
+                    "feed_stability_target", FEED_TARGET_AUTO_PRIMARY
+                )
+                if saved_target not in feed_target_options:
+                    saved_target = FEED_TARGET_AUTO_PRIMARY
+                    st.session_state["feed_stability_target"] = saved_target
+                target_idx = feed_target_options.index(saved_target)
+
+                fs_in_c1, fs_in_c2 = st.columns([1.85, 1.15])
+                with fs_in_c1:
+                    feed_stability_target = st.selectbox(
+                        "기준 원료(feed) 태그 선택",
+                        options=feed_target_options,
+                        index=target_idx,
+                        format_func=lambda k: feed_target_labels.get(k, k),
+                        disabled=(not use_feed_stability_filter),
+                        help="부하 변동률을 감시할 특정 주원료 태그(예: UCO-Feed, 나프타 유량) 또는 전체 매핑된 feed 유량 태그를 선택합니다.",
+                    )
+                    st.session_state["feed_stability_target"] = feed_stability_target
+
+                with fs_in_c2:
+                    raw_max_feed_pct_input = st.text_input(
+                        "최대 허용 부하 변동률 (max_feed_change_pct, ±%)",
+                        value=str(
+                            st.session_state.get("max_feed_change_pct_input", "5.0")
+                        ),
+                        placeholder="미입력 시 제한 없음 (예: 5.0)",
+                        disabled=(not use_feed_stability_filter),
+                        help="Before 대비 After 원료 유량 변화율이 ±입력값(%)을 초과하는 과도 구간(Turn-down/Ramp-up)을 제외합니다. 비워두면 제한 없음.",
+                    )
+                    st.session_state["max_feed_change_pct_input"] = (
+                        raw_max_feed_pct_input
+                    )
+                    parsed_max_feed_pct = _parse_optional_feed_pct(
+                        raw_max_feed_pct_input
+                    )
+                    st.session_state["max_feed_change_pct"] = parsed_max_feed_pct
+
+                feed_stability_custom_tags: List[str] = list(
+                    st.session_state.get("feed_stability_custom_tags", [])
+                )
+                if feed_stability_target == FEED_TARGET_CUSTOM_MULTI:
+                    avail_custom_tags = [
+                        (it.get("tag") or "").strip()
+                        for it in valid_feed_items_ui
+                        if (it.get("tag") or "").strip()
+                    ]
+                    feed_label_by_t = {
+                        (it.get("tag") or "").strip(): _display_var_label(it)
+                        for it in valid_feed_items_ui
+                    }
+                    default_custom = [
+                        t for t in feed_stability_custom_tags if t in avail_custom_tags
+                    ]
+                    if not default_custom and flow_feed_items_ui:
+                        default_custom = [
+                            (flow_feed_items_ui[0].get("tag") or "").strip()
+                        ]
+                    feed_stability_custom_tags = st.multiselect(
+                        "감시할 원료(feed) 태그 복수 선택",
+                        options=avail_custom_tags,
+                        default=default_custom,
+                        format_func=lambda t: feed_label_by_t.get(t, t),
+                        disabled=(not use_feed_stability_filter),
+                    )
+                    st.session_state["feed_stability_custom_tags"] = (
+                        feed_stability_custom_tags
+                    )
+
+                resolved_f_items, resolved_f_desc = resolve_feed_stability_targets(
+                    proc_df=proc_df,
+                    var_mapping=var_mapping,
+                    target_mode=feed_stability_target,
+                    custom_tags=feed_stability_custom_tags,
+                )
+                if not use_feed_stability_filter or parsed_max_feed_pct is None:
+                    st.caption(
+                        "🔓 현재 원료 부하 변동률 제한 없음 *(체크 해제 또는 `max_feed_change_pct` 미입력 상태)*"
+                    )
+                elif not resolved_f_items:
+                    st.caption(
+                        "⚠️ 감시할 기준 원료(`feed`) 태그가 아직 없습니다 *(Step 2에서 `feed` 변수를 매핑하거나 CSV 컬럼을 선택해 주세요)*."
+                    )
+                else:
+                    st.caption(
+                        f"📌 적용 기준: **{resolved_f_desc}**의 `Before → After` 변동률이 **`±{_format_num(parsed_max_feed_pct, 3)}%` 이내**인 정상 부하 구간만 추출 "
+                        f"*(초과 감량/증량 과도 구간 자동 차단)*"
+                    )
+
     # [샘플 데이터로 즉시 체험] 버튼 처리
     if sample_load_clicked:
         sample_df = create_sample_ncc_dataframe()
@@ -4755,6 +5499,8 @@ def render_step3() -> None:
         st.session_state["var_mapping"] = get_sample_ncc_mapping()
         sync_editor_base_dfs_from_mapping()
         st.session_state["lookahead_rows"] = 1
+        st.session_state["feed_stability_target"] = FEED_TARGET_AUTO_PRIMARY
+        st.session_state["feed_stability_custom_tags"] = []
         st.session_state["golden_extraction_sig"] = None
         st.session_state["step3_flash_type"] = "success"
         st.session_state["step3_flash_msg"] = (
@@ -4781,8 +5527,11 @@ def render_step3() -> None:
         return
 
     # --------------------------------------------------------------------------
-    # 2) 모든 KPI threshold 만족 구간 자동 탐색 및 동기화
+    # 2) 4단계 도메인 정합성 필터 만족 구간 자동 탐색 및 시그니처 동기화
     # --------------------------------------------------------------------------
+    eff_max_feed_pct_cur = (
+        parsed_max_feed_pct if bool(use_feed_stability_filter) else None
+    )
     current_sig = json.dumps(
         {
             "file_id": st.session_state.get("loaded_file_id"),
@@ -4791,10 +5540,16 @@ def render_step3() -> None:
             "resample_agg": st.session_state.get("resample_agg"),
             "time_col": str(time_col),
             "lookahead": int(lookahead_val),
+            "feed": var_mapping.get("feed", []),
             "kpi": var_mapping.get("kpi", []),
             "control": var_mapping.get("control", []),
             "state": var_mapping.get("state", []),
             "use_smart_deadband": bool(use_smart_deadband),
+            "require_active_control": bool(require_active_control),
+            "use_feed_stability_filter": bool(use_feed_stability_filter),
+            "feed_stability_target": str(feed_stability_target),
+            "feed_stability_custom_tags": list(feed_stability_custom_tags),
+            "max_feed_change_pct": eff_max_feed_pct_cur,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -4816,6 +5571,11 @@ def render_step3() -> None:
             lookahead_rows=int(lookahead_val),
             notes_cache=st.session_state.get("golden_notes_cache", {}),
             use_smart_deadband=bool(use_smart_deadband),
+            require_active_control=bool(require_active_control),
+            use_feed_stability_filter=bool(use_feed_stability_filter),
+            feed_stability_target=str(feed_stability_target),
+            max_feed_change_pct=eff_max_feed_pct_cur,
+            feed_stability_custom_tags=list(feed_stability_custom_tags),
         )
         st.session_state["golden_extraction_sig"] = current_sig
         st.session_state["golden_diag_msgs"] = diag_msgs
@@ -4826,12 +5586,12 @@ def render_step3() -> None:
 
     if golden_base_df is None or golden_base_df.empty:
         st.warning(
-            f"⚠️ 설정한 비교 간격(`lookahead_rows = {int(lookahead_val)}`)과 모든 KPI의 개선 기준(`threshold`) 및 물리적 유효 범위(`valid_min`~`valid_max`) 조건을 동시에 만족하는 운전 구간(Before → After)이 없습니다."
+            f"⚠️ 설정한 비교 간격(`lookahead_rows = {int(lookahead_val)}`)과 4단계 도메인 필터(① KPI 물리적 유효 범위 · ② 원료 부하 안정성 · ③ KPI 개선 기준 · ④ 최소 유의미 제어 조작) 조건을 동시에 만족하는 운전 구간(Before → After)이 없습니다."
         )
         if diag_msgs:
             with st.container(border=True):
                 st.markdown(
-                    "**💡 필터링 제외 현황 및 데이터 내 KPI 최대 변화폭 진단 (`threshold` / `valid_min` / `valid_max` 조정 참고용)**"
+                    "**💡 단계별 필터링 제외 현황 및 데이터 내 KPI 최대 변화폭 진단 (필터 기준 미세 조정 참고용)**"
                 )
                 for d_msg in diag_msgs:
                     st.markdown(d_msg)
@@ -4840,7 +5600,7 @@ def render_step3() -> None:
     if diag_msgs:
         with st.container(border=True):
             st.markdown(
-                "**📊 KPI 개선 기준(`threshold`) 및 물리적 유효 범위(`valid_min`~`valid_max`) 필터링 진단 현황**"
+                "**📊 Step 3 통합 도메인 필터링 진단 리포트 (① KPI 물리 유효 범위 · ② 원료 부하 급변 · ③ KPI 개선 기준 · ④ 무조작 제외)**"
             )
             for d_msg in diag_msgs:
                 st.markdown(d_msg)
@@ -4942,6 +5702,7 @@ def render_step3() -> None:
             "케이스 ID",
             "Before 시점",
             "After 시점",
+            "원료 부하 추이 (Before→After)",
             "제어 변수 변화 (Before→After)",
             "KPI 개선 결과 (Before→After)",
             "상태/제약 추이",
@@ -4954,6 +5715,7 @@ def render_step3() -> None:
             "After 행",
             "Before 시점",
             "After 시점",
+            "원료 부하 추이 (Before→After)",
             "제어 변수 변화 (Before→After)",
             "KPI 개선 결과 (Before→After)",
             "상태/제약 추이",
@@ -4976,6 +5738,11 @@ def render_step3() -> None:
             ),
             "After 시점": st.column_config.TextColumn(
                 "After 시점 (조작 후)",
+                width="medium",
+            ),
+            "원료 부하 추이 (Before→After)": st.column_config.TextColumn(
+                "원료 부하 추이 (Feed Stability)",
+                help="기준 원료(feed) 유량의 Before → After 변화 및 변동률(%) 요약",
                 width="medium",
             ),
             "제어 변수 변화 (Before→After)": st.column_config.TextColumn(
@@ -5235,10 +6002,23 @@ def render_step4() -> None:
             if use_smart_deadband_s4
             else "개별 min_delta만 적용 (스마트 불감대 OFF)"
         )
+        req_ctrl_s4 = bool(st.session_state.get("require_active_control", True))
+        use_fs_s4 = bool(st.session_state.get("use_feed_stability_filter", True))
+        max_fp_s4 = _parse_optional_feed_pct(
+            st.session_state.get("max_feed_change_pct")
+        )
+        fs_s4_badge = (
+            f"원료 부하 안정 ±{_format_num(max_fp_s4, 3)}% 이내"
+            if (use_fs_s4 and max_fp_s4 is not None)
+            else "원료 부하 변동 제한 없음"
+        )
+        ctrl_s4_badge = (
+            "핵심 제어 조작 ≥ 1개" if req_ctrl_s4 else "무조작(0개 조작) 포함 허용"
+        )
 
         st.info(
             f"📦 **Step 3 선택 샘플**: 총 **`{total_selected}`건**  |  {split_mode_desc}\n\n"
-            f"🎛️ **적용된 제어 권고(`output`) 설정**: `{control_output_mode_s4}` · `{deadband_badge}`\n\n"
+            f"🎛️ **적용된 제어 권고(`output`) 및 정합성 필터**: `{control_output_mode_s4}` · `{deadband_badge}` · `{fs_s4_badge}` · `{ctrl_s4_badge}`\n\n"
             f"🗂️ **LLaMA-Factory 자동 등록 대상**: `{info_path_preview}` (기존 등록 데이터셋 보존 및 병합 업데이트)"
         )
 
